@@ -378,3 +378,158 @@ GENERAL RULES
 - Do not include markdown or code fences.
 - Only include JSON fields relevant to the query type.
 """
+
+
+# ─────────────────────────────────────────────
+# COLLECTIONS
+# ─────────────────────────────────────────────
+
+COLLECTIONS_CONTEXT = """
+Table/View name: collections
+
+Default Currency:
+INR
+
+Business purpose:
+This view contains payment/collection data linked to invoices. It is used to analyze
+collected amounts, collection timelines, ageing buckets, customers, regions, subsidiaries,
+currencies, and inter-company collections.
+
+Grain:
+One row per payment-to-invoice link. A single payment may link to multiple invoices,
+producing multiple rows per payment_id. Vice-versa multiple payments can link to one invoice.
+
+Important filters:
+- inter_company_status = 'T' means inter-company collection.
+- inter_company_status = 'F' means external customer collection.
+- tds_flag = 'T' means the collection entry is a TDS (tax deducted at source) payment.
+- tds_flag = 'F' means a regular collection.
+
+Default filters to ALWAYS apply unless user explicitly overrides:
+- inter_company_status = 'F'  (exclude intercompany)
+- tds_flag is NOT filtered by default; include all collections unless user asks for
+  "net collections", "excluding TDS", or "collections excluding tax", in which case
+  add tds_flag = 'F'.
+
+Columns:
+
+payment_id:
+Transaction ID of the payment.
+
+payment_number:
+Transaction number of the payment.
+
+payment_date:
+Date of payment.
+
+txn_currency_id:
+ID of the transaction currency.
+
+txn_currency_symbol:
+Symbol of the transaction currency.
+
+inr_exchangerate:
+Exchange rate from transaction currency to INR.
+
+usd_exchangerate:
+Exchange rate from transaction currency to USD.
+
+subsidiary_id:
+ID of the billing subsidiary.
+
+subsidiary_country:
+Country of the billing subsidiary.
+
+collection_amt:
+Collection amount in transaction currency.
+
+invoice_id:
+Transaction ID of the invoice from which the collection is made.
+
+customer_id:
+ID of the customer.
+
+customer_name:
+Name of the customer.
+
+inter_company_status:
+'T' if inter-company collection, 'F' if external customer collection.
+
+invoice_date:
+Date when the invoice was raised.
+
+due_date:
+Date when the invoice was due.
+
+invoice_number:
+Transaction number of the invoice.
+
+tds_flag:
+'T' if this collection entry is a TDS/tax payment, 'F' if a regular collection.
+
+ageingbucket:
+Ageing timeline of the collection relative to invoice due date.
+Valid values in sort order:
+  'Within CP'   → paid on or before due date
+  '1-15 days'   → 1 to 15 days late
+  '16-30 days'  → 16 to 30 days late
+  '31-45 days'  → 31 to 45 days late
+  '46-60 days'  → 46 to 60 days late
+  '61-90 days'  → 61 to 90 days late
+  '>90 days'    → more than 90 days late
+
+fy_quarter:
+Financial year and quarter of the payment date, example FY26 Q1.
+
+region_name:
+Standard mapped region name of the customer.
+
+billing_entity:
+Name of the billing subsidiary (entity raising the invoice).
+
+billed_entity:
+Name of the paying entity. Use only for intercompany transactions.
+
+Currency Rules:
+- collection_amt is stored in transaction currency.
+- To report in INR: collection_amt * inr_exchangerate
+- To report in USD: collection_amt * usd_exchangerate
+- Default reporting currency is INR.
+- If user does not specify currency, report in INR.
+- If user asks for USD, use USD conversion.
+- Never use pre-computed collection_amt_inr or collection_amt_usd columns;
+  always compute inside SQL using exchange rate columns.
+
+Metric Conversion Rules:
+- Collections in INR: SUM(collection_amt * inr_exchangerate) AS collection_inr
+- Collections in USD: SUM(collection_amt * usd_exchangerate) AS collection_usd
+- Net collections in INR (TDS excluded): SUM(collection_amt * inr_exchangerate) AS net_collection_inr WHERE tds_flag = 'F'
+- Net collections in USD (TDS excluded): SUM(collection_amt * usd_exchangerate) AS net_collection_usd WHERE tds_flag = 'F'
+
+Common Query Rules:
+- For external customer reporting, filter inter_company_status = 'F'.
+- For inter-company reporting, filter inter_company_status = 'T'.
+- If user does not mention inter-company, default to inter_company_status = 'F'.
+- For net / excluding-TDS collections, add tds_flag = 'F'.
+- For quarterly analysis, group by fy_quarter.
+- For ageing analysis, group by ageingbucket. Sort by the defined bucket order, not alphabetically.
+- For customer-level analysis, group by customer_name and customer_id.
+- For region-level analysis, group by region_name.
+- For subsidiary-level analysis, group by billing_entity.
+- For currency analysis, group by txn_currency_symbol.
+- Use PostgreSQL syntax only.
+- Only generate SELECT queries.
+- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE.
+
+Ageing Bucket Sort Order:
+When ordering by ageingbucket, use CASE WHEN to enforce logical order:
+CASE ageingbucket
+  WHEN 'Within CP'  THEN 1
+  WHEN '1-15 days'  THEN 2
+  WHEN '16-30 days' THEN 3
+  WHEN '31-45 days' THEN 4
+  WHEN '46-60 days' THEN 5
+  WHEN '61-90 days' THEN 6
+  WHEN '>90 days'   THEN 7
+END
+"""
