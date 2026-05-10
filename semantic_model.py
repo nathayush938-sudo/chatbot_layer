@@ -285,14 +285,24 @@ METRICS:
 
 TDS TERMINOLOGY DISAMBIGUATION:
 - "TDS deducted" / "net of TDS" / "after TDS" / "excluding TDS" / "TDS-deducted"
-  / "total minus TDS" / "collections TDS deducted"
-  → ALL mean net collections → filter tds_flag = 'F'
+  / "total minus TDS" / "collections TDS deducted" / "tax-deducted" / "tax deducted"
+  / "collections, tax-deducted" / "collections net" / "net collection"
+  → ALL mean net collections → ONE metric only → filter tds_flag = 'F'
+  → Do NOT return both total_collections and tds_amount together
 
 - "TDS amount" / "TDS collected" / "show TDS" / "only TDS" / "tax deducted at source"
-  → mean the TDS component only → filter tds_flag = 'T'
+  / "show me TDS" / "how much TDS"
+  → mean the TDS component only → ONE metric → filter tds_flag = 'T'
 
 - "gross collections" / "total collections" / "all collections" (with no TDS mention)
   → include all rows → no tds_flag filter
+
+- "total collections and TDS" / "collections with TDS breakup" / "show both"
+  → TWO metrics: total_collections_inr (no tds filter) + tds_amount_inr (tds_flag = 'T')
+
+CRITICAL: If the user uses "tax-deducted" or "TDS-deducted" as a QUALIFIER after
+"total collections", treat it as a filter (net collections), NOT as a second metric.
+"total collections, tax-deducted" = net collections only = tds_flag = 'F', ONE column.
 
 DIMENSIONS:
 - region / region wise = region_name

@@ -558,8 +558,28 @@ if user_input:
                 st.dataframe(pivot_df, width='stretch', hide_index=True)
 
             else:
-                df = apply_display_formatting(df, metadata)
-                st.dataframe(df, width='stretch', hide_index=True)
+                # Single-row result → show as KPI cards instead of a table
+                if len(df) == 1:
+                    display_meta = metadata.get("display", {})
+                    currency     = display_meta.get("currency", "USD")
+                    col_map      = {k: strip_currency_suffix(v)
+                                    for k, v in display_meta.get("columns", {}).items()}
+                    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+                    metric_cols  = [c for c in numeric_cols if is_metric_column(c)]
+
+                    if metric_cols:
+                        kpi_cols = st.columns(len(metric_cols))
+                        for i, col in enumerate(metric_cols):
+                            label = col_map.get(col, col)
+                            label = strip_currency_suffix(label)
+                            value = format_currency_value(float(df[col].iloc[0]), currency)
+                            kpi_cols[i].metric(label=label, value=value)
+                    else:
+                        df = apply_display_formatting(df, metadata)
+                        st.dataframe(df, width='stretch', hide_index=True)
+                else:
+                    df = apply_display_formatting(df, metadata)
+                    st.dataframe(df, width='stretch', hide_index=True)
 
         except Exception as render_err:
             st.error(f"Rendering error: {render_err}")
