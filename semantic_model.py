@@ -20,8 +20,12 @@ METRICS:
    INR: SUM(billed_amt * inr_exchangerate) AS billed_revenue_inr
 
 2. Tax / tax amount:
-   USD: SUM(billed_tax_amt * usd_exchangerate) AS tax_amount_usd
-   INR: SUM(billed_tax_amt * inr_exchangerate) AS tax_amount_inr
+   USD: SUM(COALESCE(billed_tax_amt, 0) * usd_exchangerate) AS tax_amount_usd
+   INR: SUM(COALESCE(billed_tax_amt, 0) * inr_exchangerate) AS tax_amount_inr
+   IMPORTANT: always use COALESCE(billed_tax_amt, 0) to handle NULL tax values.
+   Always use the full alias tax_amount_usd or tax_amount_inr — never just tax_amount.
+   Always include "tax_amount_usd": "Tax Amount" or "tax_amount_inr": "Tax Amount"
+   in display.columns.
 
 3. Subscription revenue:
    USD: SUM(subscriptionfee * usd_exchangerate) AS subscription_revenue_usd
@@ -49,37 +53,36 @@ DIMENSIONS:
 - customer id = customer_id
 - quarter / QoQ / quarter-on-quarter / quarterly = fy_quarter
 - currency / transaction currency / currency mix = txn_currency_symbol
-- subsidiary / billing entity = subsidiary_name
-- billed entity = billed_entity
-- billing entity = billing_entity
+- billing entity / subsidiary / billing subsidiary / entity = billingentity
+  NEVER use subsidiary_name — always use billingentity for entity-level grouping
+- billed entity = billedentity
 - billing number / invoice number = billing_number
 - billing date / invoice date = billing_date
 - country = subsidiary_country
 
 TIME RULES:
-- YTD means current financial year to date.
-- Current financial year is FY26.
-- For YTD, filter fy_quarter LIKE 'FY26%'.
-- QoQ / quarter-on-quarter means group by fy_quarter.
-- Quarterly means group by fy_quarter.
+- Use fy_quarter column for all FY and quarter filtering (format: 'FY26 Q1', 'FY26 Q2', etc.).
+- fy_quarter is pre-computed in the view; use it freely in both WHERE and GROUP BY.
+- Only use billing_date directly for custom date ranges not expressible as FY/quarter.
+- If no time period is specified, default to the previous complete FY
+  (e.g. fy_quarter LIKE 'FY26%'). The exact label is provided in the system prompt.
+- YTD = filter fy_quarter LIKE '<current_fy>%' as provided in the system prompt.
+- Specific FY = fy_quarter LIKE 'FY26%'.
+- Specific quarter = fy_quarter = 'FY26 Q2'.
+- QoQ / quarter-on-quarter = GROUP BY fy_quarter, ORDER BY fy_quarter ASC.
+- Quarterly = GROUP BY fy_quarter.
 
 Sorting Rules:
 
-- Unless user explicitly asks alphabetical ordering, reports should be ordered by business importance/value.
-- For grouped tables:
-  ORDER BY primary metric DESC
-
-- For pivots/matrices:
-  row entities should be ordered by total metric DESC.
-  column entities should also preferably follow total metric DESC.
-
-- Region splits, customer splits, subsidiary splits:
-  order by billed revenue DESC.
-
-- Top reports:
-  always order by metric DESC.
-
-- Do not default to alphabetical ordering unless explicitly requested.
+- Do NOT add ORDER BY to SQL. Python handles all sorting after the query returns.
+- Python sort logic:
+    - Time dimensions (fy_quarter, date, month, year, period): sorted chronologically ASC
+    - All other dimensions (region, customer, entity, currency): sorted by metric value DESC
+- Exception: if user asks for "top N" or "bottom N", add ORDER BY + LIMIT N in SQL
+  because the DB must rank before limiting.
+  For top N: ORDER BY primary_metric_alias DESC LIMIT N
+  For bottom N: ORDER BY primary_metric_alias ASC LIMIT N
+  Always use SELECT aliases in ORDER BY, never repeat full expressions.
 
 Limit Rules:
 - For "top N" or "bottom N" requests, always add LIMIT N to the query.
@@ -104,13 +107,31 @@ When user says:
 - invoice split
 - revenue type split
 
-Interpret as metric pivot with these columns:
+ALWAYS include ALL of these metric columns — no exceptions, regardless of other rules:
 - subscription revenue
 - implementation revenue
 - integration revenue
 - studio revenue
 - other service revenue
-- tax amount
+- tax amount   ← ALWAYS included in type split, even without explicit mention
+
+Tax amount is a CORE part of invoice type split by definition.
+STRICT_METRIC_SELECTION_RULES does NOT apply to type splits — include all 6 columns always.
+
+CRITICAL: Always return visualization = "pivot_table" and pivot_type = "metric" for type splits.
+NEVER return visualization = "table" for a type split, even if there is no grouping dimension.
+When there is no grouping dimension (overall split only):
+  - visualization = "pivot_table"
+  - pivot_type = "metric"
+  - rows = []   ← empty list, no dimension
+  - metric_columns = [all the revenue + tax aliases]
+  - SQL has no GROUP BY
+When a dimension is present (e.g. region, quarter):
+  - visualization = "pivot_table"
+  - pivot_type = "metric"
+  - rows = [dimension]
+  - metric_columns = [all 6 revenue + tax aliases]
+  - SQL has GROUP BY dimension
 
 
 REPORT STRUCTURE RULES:
@@ -160,7 +181,7 @@ COMMON DASHBOARD REPORTS:
    dimension pivot with rows = txn_currency_symbol, columns = fy_quarter, values = billed revenue.
 
 4. YTD Billing - Billing Entity Split:
-   grouped table by subsidiary_name, value = billed revenue.
+   grouped table by billingentity, value = billed revenue.
 
 5. Top Billed Customers:
    grouped table by customer_name, value = billed revenue, ordered descending.
@@ -169,7 +190,35 @@ COMMON DASHBOARD REPORTS:
    grouped table by region_name, value = billed revenue.
 
 7. Intercompany Billing:
-   dimension pivot with rows = subsidiary_name AS billing_entity, columns = customer_name AS billed_entity, values = billed amount, filter inter_company_status = 'T'.
+   dimension pivot with rows = billingentity, columns = billedentity, values = billed amount, filter inter_company_status = 'T'.
+
+DIMENSION VALIDATION:
+Valid billing dimensions (only these can be used in GROUP BY):
+  region_name, customer_name, customer_id, fy_quarter,
+  txn_currency_symbol, billingentity, billedentity,
+  billing_number, billing_date, subsidiary_country
+NOTE: subsidiary_name is NOT a valid dimension. Use billingentity instead.
+
+If the user mentions a word that is NOT in this list as a grouping dimension:
+- Do NOT use it as a GROUP BY column.
+- Do NOT silently ignore it and return an aggregate with no GROUP BY.
+- Set explanation to clearly state: "'<word>' is not a valid dimension.
+  Valid dimensions are: region, customer, quarter, currency, subsidiary, etc."
+- Still generate the best possible SQL (e.g. overall total if no valid dimension given).
+
+DIMENSION VALIDATION:
+Valid collections dimensions (only these can be used in GROUP BY):
+  region_name, customer_name, customer_id, fy_quarter,
+  txn_currency_symbol, billing_entity, billed_entity,
+  payment_number, payment_date, invoice_number, invoice_date,
+  due_date, subsidiary_country, ageingbucket
+
+If the user mentions a word that is NOT in this list as a grouping dimension:
+- Do NOT use it as a GROUP BY column.
+- Do NOT silently ignore it and return an aggregate with no GROUP BY.
+- Set explanation to clearly state: "'<word>' is not a valid dimension.
+  Valid dimensions are: region, customer, quarter, currency, billing entity, ageing bucket, etc."
+- Still generate the best possible SQL (e.g. overall total if no valid dimension given).
 
 DISPLAY RULES:
 - Always include display metadata.
@@ -177,6 +226,22 @@ DISPLAY RULES:
 - display.currency should be USD or INR.
 - display.columns should map SQL aliases to clean display names.
 - display.formatting should define currency formatting for all amount columns.
+
+SQL OPTIMISATION RULES:
+- Do NOT add ORDER BY to SQL unless it is a top N / bottom N query. Python sorts the results.
+- Never repeat full SUM expressions anywhere. Always use SELECT aliases.
+- Keep SQL minimal: SELECT, FROM, WHERE, GROUP BY only. No ORDER BY unless top/bottom N.
+- Always use fy_quarter for time filtering (not billing_date) unless user gives a custom date range.
+  Good: WHERE fy_quarter LIKE 'FY26%'
+  Bad:  WHERE billing_date >= '2025-04-01' AND billing_date <= '2026-03-31'
+- All metric aliases MUST include a currency suffix: _usd or _inr. Never use bare aliases like
+  tax_amount, subscription_revenue. Always: tax_amount_usd, subscription_revenue_usd, etc.
+- display.columns MUST map every SQL alias to a clean display name.
+  Every alias in SELECT must have a corresponding entry in display.columns.
+- Display names must NOT include the currency suffix in brackets.
+  Bad:  "subscription_revenue_usd": "Subscription Revenue (USD)"
+  Good: "subscription_revenue_usd": "Subscription Revenue"
+  The currency symbol ($, ₹) on the formatted amount already communicates the currency.
 """
 
 
@@ -201,17 +266,33 @@ DEFAULT RULES:
 - For intercompany collections, use inter_company_status = 'T'.
 
 METRICS:
-1. Collections / collected amount / receipts / payments received:
+1. Collections / collected amount / receipts / payments received / gross collections:
    INR: SUM(collection_amt * inr_exchangerate) AS collection_inr
    USD: SUM(collection_amt * usd_exchangerate) AS collection_usd
+   Filter: no tds_flag filter (include all rows)
 
-2. Net collections / collections excluding TDS / collections excluding tax:
+2. Net collections / collections excluding TDS / collections excluding tax /
+   collections net of TDS / after TDS / TDS deducted / total collections minus TDS /
+   collections TDS-deducted:
    INR: SUM(collection_amt * inr_exchangerate) AS net_collection_inr  WHERE tds_flag = 'F'
    USD: SUM(collection_amt * usd_exchangerate) AS net_collection_usd  WHERE tds_flag = 'F'
+   Filter: tds_flag = 'F' (exclude TDS rows)
 
-3. TDS amount / tax collected:
+3. TDS amount / TDS collected / tax deducted / only TDS / show TDS:
    INR: SUM(collection_amt * inr_exchangerate) AS tds_amount_inr  WHERE tds_flag = 'T'
    USD: SUM(collection_amt * usd_exchangerate) AS tds_amount_usd  WHERE tds_flag = 'T'
+   Filter: tds_flag = 'T' (only TDS rows)
+
+TDS TERMINOLOGY DISAMBIGUATION:
+- "TDS deducted" / "net of TDS" / "after TDS" / "excluding TDS" / "TDS-deducted"
+  / "total minus TDS" / "collections TDS deducted"
+  → ALL mean net collections → filter tds_flag = 'F'
+
+- "TDS amount" / "TDS collected" / "show TDS" / "only TDS" / "tax deducted at source"
+  → mean the TDS component only → filter tds_flag = 'T'
+
+- "gross collections" / "total collections" / "all collections" (with no TDS mention)
+  → include all rows → no tds_flag filter
 
 DIMENSIONS:
 - region / region wise = region_name
@@ -244,17 +325,35 @@ AGEING BUCKET RULES:
     END
 
 TIME RULES:
-- YTD means current financial year to date.
-- Current financial year is FY26.
-- For YTD, filter fy_quarter LIKE 'FY26%'.
-- QoQ / quarter-on-quarter means group by fy_quarter.
-- Quarterly means group by fy_quarter.
+- Use fy_quarter column for all FY and quarter filtering (format: 'FY26 Q1', 'FY26 Q2', etc.).
+- fy_quarter is pre-computed in the view; use it freely in both WHERE and GROUP BY.
+- Only use payment_date directly for custom date ranges not expressible as FY/quarter.
+- If no time period is specified, default to the previous complete FY
+  (e.g. fy_quarter LIKE 'FY26%'). The exact label is provided in the system prompt.
+- YTD = filter fy_quarter LIKE '<current_fy>%' as provided in the system prompt.
+- Specific FY = fy_quarter LIKE 'FY26%'.
+- Specific quarter = fy_quarter = 'FY26 Q2'.
+- QoQ / quarter-on-quarter = GROUP BY fy_quarter, ORDER BY fy_quarter ASC.
+- Quarterly = GROUP BY fy_quarter.
 
 SORTING RULES:
-- For grouped tables: ORDER BY primary metric DESC.
-- For ageing bucket reports: ORDER BY ageingbucket using the CASE WHEN sort defined above.
-- For top/bottom reports: always order by metric DESC.
-- Do not default to alphabetical ordering unless explicitly requested.
+- Do NOT add ORDER BY to SQL. Python handles all sorting after the query returns.
+- Exception: if user asks for "top N" or "bottom N", add ORDER BY + LIMIT N in SQL
+  because the DB must rank before limiting.
+  For top N: ORDER BY primary_metric_alias DESC LIMIT N
+  For bottom N: ORDER BY primary_metric_alias ASC LIMIT N
+  Always use SELECT aliases in ORDER BY, never repeat full expressions.
+- Exception: ageing bucket reports — use CASE WHEN ORDER BY in SQL so bucket order
+  is always correct regardless of Python sorting:
+  ORDER BY CASE ageingbucket
+    WHEN 'Within CP'  THEN 1
+    WHEN '1-15 days'  THEN 2
+    WHEN '16-30 days' THEN 3
+    WHEN '31-45 days' THEN 4
+    WHEN '46-60 days' THEN 5
+    WHEN '61-90 days' THEN 6
+    WHEN '>90 days'   THEN 7
+  END
 
 LIMIT RULES:
 - For "top N" or "bottom N" requests, always add LIMIT N to the query.
@@ -342,4 +441,12 @@ DISPLAY RULES:
 - display.currency should be USD or INR.
 - display.columns should map SQL aliases to clean display names.
 - display.formatting should define currency formatting for all amount columns.
+
+SQL OPTIMISATION RULES:
+- Do NOT add ORDER BY to SQL unless it is a top N / bottom N or ageing bucket query. Python sorts results.
+- Never repeat full SUM expressions anywhere. Always use SELECT aliases.
+- Keep SQL minimal: SELECT, FROM, WHERE, GROUP BY only. No ORDER BY unless top/bottom N or ageing.
+- Always use fy_quarter for time filtering (not payment_date) unless user gives a custom date range.
+  Good: WHERE fy_quarter LIKE 'FY26%'
+  Bad:  WHERE payment_date >= '2025-04-01' AND payment_date <= '2026-03-31'
 """

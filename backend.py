@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from anthropic import Anthropic
 from sqlalchemy import create_engine, text
+from datetime import date
 import pandas as pd
 import os
 
@@ -23,6 +24,46 @@ database_url = os.getenv("DATABASE_URL")
 
 client = Anthropic(api_key=api_key)
 engine = create_engine(database_url) if database_url else None
+
+
+def get_fy_info() -> dict:
+    """
+    Computes Indian financial year (April-March) boundaries.
+    Returns labels and ISO date strings for current and previous FY.
+
+    Indian FY quarters:
+      Q1 = April   - June       (months 4-6)
+      Q2 = July    - September  (months 7-9)
+      Q3 = October - December   (months 10-12)
+      Q4 = January - March      (months 1-3)
+
+    Default reporting period = previous complete FY (data is always complete).
+    Current FY = YTD only, used when user explicitly asks for YTD or current year.
+    """
+    today = date.today()
+
+    if today.month >= 4:
+        cur_end_year = today.year + 1
+    else:
+        cur_end_year = today.year
+
+    current_fy  = f"FY{str(cur_end_year)[-2:]}"
+    previous_fy = f"FY{str(cur_end_year - 1)[-2:]}"
+
+    cur_fy_start  = date(cur_end_year - 1, 4, 1)
+    cur_fy_end    = date(cur_end_year, 3, 31)
+    prev_fy_start = date(cur_end_year - 2, 4, 1)
+    prev_fy_end   = date(cur_end_year - 1, 3, 31)
+
+    return {
+        "current_fy":    current_fy,
+        "previous_fy":   previous_fy,
+        "cur_fy_start":  cur_fy_start.isoformat(),
+        "cur_fy_end":    cur_fy_end.isoformat(),
+        "prev_fy_start": prev_fy_start.isoformat(),
+        "prev_fy_end":   prev_fy_end.isoformat(),
+        "today":         today.isoformat(),
+    }
 
 
 class ChatRequest(BaseModel):
@@ -148,6 +189,53 @@ def classify_domain(message: str) -> str:
 
 
 def build_system_prompt(domain: str) -> str:
+    fy = get_fy_info()
+
+    # Quarter date boundaries for dynamic filtering (Indian FY)
+    # These let Claude filter by specific quarters using the date column
+    # instead of the hardcoded fy_quarter string column.
+    quarter_ranges = f"""
+Indian FY Quarter Date Ranges (for dynamic filtering):
+  Q1 = April 1  to June 30
+  Q2 = July 1   to September 30
+  Q3 = October 1 to December 31
+  Q4 = January 1 to March 31
+
+To filter a specific quarter, compute the calendar year from the FY label:
+  FY{fy["previous_fy"][2:]} Q1 = {fy["prev_fy_start"][:4]}-04-01 to {fy["prev_fy_start"][:4]}-06-30
+  FY{fy["previous_fy"][2:]} Q2 = {fy["prev_fy_start"][:4]}-07-01 to {fy["prev_fy_start"][:4]}-09-30
+  FY{fy["previous_fy"][2:]} Q3 = {fy["prev_fy_start"][:4]}-10-01 to {fy["prev_fy_start"][:4]}-12-31
+  FY{fy["previous_fy"][2:]} Q4 = {fy["prev_fy_end"][:4]}-01-01  to {fy["prev_fy_end"]}
+  FY{fy["current_fy"][2:]} Q1  = {fy["cur_fy_start"][:4]}-04-01 to {fy["cur_fy_start"][:4]}-06-30
+  FY{fy["current_fy"][2:]} Q2  = {fy["cur_fy_start"][:4]}-07-01 to {fy["cur_fy_start"][:4]}-09-30
+  FY{fy["current_fy"][2:]} Q3  = {fy["cur_fy_start"][:4]}-10-01 to {fy["cur_fy_start"][:4]}-12-31
+  FY{fy["current_fy"][2:]} Q4  = {fy["cur_fy_end"][:4]}-01-01  to {fy["cur_fy_end"]}
+"""
+
+    date_and_time_rules = f"""
+Financial Year Context (computed at runtime):
+  Current FY  : {fy["current_fy"]}  ({fy["cur_fy_start"]} to {fy["cur_fy_end"]})
+  Previous FY : {fy["previous_fy"]} ({fy["prev_fy_start"]} to {fy["prev_fy_end"]})
+  Today       : {fy["today"]}
+
+Default Time Period Rules:
+- If the user does NOT specify any time period, default to the PREVIOUS complete FY
+  ({fy["previous_fy"]}: {fy["prev_fy_start"]} to {fy["prev_fy_end"]}).
+  Current year data is incomplete; previous year gives a full picture.
+- If the user says "YTD" or "current year", filter from {fy["cur_fy_start"]} to {fy["today"]}.
+- If the user specifies a FY (e.g. FY26), use that year's full date range.
+- If the user specifies a quarter (e.g. Q2 FY26), use the corresponding date range above.
+- If the user specifies a custom date range, use it directly.
+
+Date Column Rules:
+- For BILLING   : always use billing_date for date filtering (not fy_quarter).
+- For COLLECTIONS: always use payment_date for date filtering (not fy_quarter).
+- Use fy_quarter column ONLY for GROUP BY / display, never for WHERE filtering.
+- For grouping by quarter in display, fy_quarter column can be used as-is.
+
+{quarter_ranges}
+"""
+
     if domain == "collections":
         return f"""
 You are a finance analytics assistant specializing in collections.
@@ -161,6 +249,8 @@ Use the following table/view context:
 {STRICT_METRIC_SELECTION_RULES}
 
 {COLLECTIONS_SEMANTIC_MODEL}
+
+{date_and_time_rules}
 
 Core Rules:
 - Generate PostgreSQL queries only.
@@ -212,6 +302,8 @@ Use the following table/view context:
 
 {BILLING_SEMANTIC_MODEL}
 
+{date_and_time_rules}
+
 Core Rules:
 - Generate PostgreSQL queries only.
 - Only SELECT statements are allowed.
@@ -223,7 +315,6 @@ Core Rules:
 - Always use the provided tool to return structured output.
 
 Currency Rules:
-- Follow the default currency defined in the relevant context.
 - For billing, default currency is USD unless the user explicitly asks for INR.
 - Billing amount/fee/tax columns are in transaction currency.
 - Convert using usd_exchangerate or inr_exchangerate inside SQL.
@@ -242,7 +333,7 @@ Display Rules:
 # VALIDATORS
 # ─────────────────────────────────────────────
 
-def validate_sql(sql: str) -> str:
+def validate_sql(sql: str, metadata: dict = None) -> str:
     cleaned = sql.strip().lower()
 
     blocked_words = [
@@ -255,6 +346,21 @@ def validate_sql(sql: str) -> str:
 
     if any(word in cleaned for word in blocked_words):
         raise HTTPException(status_code=400, detail="Unsafe SQL detected.")
+
+    # If a pivot/table has row dimensions specified, SQL must GROUP BY something
+    if metadata:
+        rows = metadata.get("rows", [])
+        viz  = metadata.get("visualization", "")
+        if rows and "group by" not in cleaned:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid query: dimensions {rows} were requested but the generated "
+                    f"SQL has no GROUP BY clause. The dimension(s) may not exist in the schema. "
+                    f"Please rephrase using a valid dimension such as region, customer, quarter, "
+                    f"currency, subsidiary, or billing entity."
+                )
+            )
 
     return sql
 
@@ -283,10 +389,16 @@ def chat(request: ChatRequest):
     domain = classify_domain(request.message)
     system_prompt = build_system_prompt(domain)
 
+    import time
+
     try:
+        print(f"\n[{domain.upper()}] Query: {request.message}")
+
+        t0 = time.time()
+        print(f"  → Calling Claude...")
         claude_response = client.messages.create(
             model="claude-haiku-4-5",
-            max_tokens=1000,
+            max_tokens=4096,
             temperature=0,
             system=system_prompt,
             messages=[
@@ -298,9 +410,12 @@ def chat(request: ChatRequest):
                 "name": "generate_sql_response"
             }
         )
+        t1 = time.time()
+        print(f"  ✓ Claude responded in {t1 - t0:.1f}s "
+              f"(in={claude_response.usage.input_tokens} "
+              f"out={claude_response.usage.output_tokens} tokens)")
 
         parsed = None
-
         for block in claude_response.content:
             if block.type == "tool_use":
                 parsed = block.input
@@ -312,9 +427,17 @@ def chat(request: ChatRequest):
                 detail="Claude did not return structured tool output"
             )
 
-        sql = validate_sql(parsed["sql"])
+        sql = validate_sql(parsed["sql"], parsed)
+        print(f"  → Running SQL:\n{sql}")
 
+        t2 = time.time()
         df = pd.read_sql_query(text(sql), engine)
+        t3 = time.time()
+        print(f"  ✓ DB returned {len(df)} rows in {t3 - t2:.1f}s")
+        print(f"  ✓ Total: {t3 - t0:.1f}s")
+
+        # Replace NaN/Inf with None so JSON serialization never fails
+        df = df.where(pd.notnull(df), None)
 
         return {
             "metadata": parsed,
@@ -328,4 +451,5 @@ def chat(request: ChatRequest):
         }
 
     except Exception as e:
+        print(f"  ✗ Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

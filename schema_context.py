@@ -80,13 +80,11 @@ usd_exchangerate:
 Exchange rate used to convert transaction currency to USD.
 
 subsidiary_id:
-Subsidiary ID.
-
-subsidiary_name:
-Subsidiary Name.
+Subsidiary ID (internal use only, do not expose in reports).
 
 billingentity:
-Billing subsidiary.
+Billing entity / billing subsidiary. Always use this column for billing entity grouping.
+Never use subsidiary_name.
 
 billedentity:
 Billed entity.
@@ -186,6 +184,10 @@ Only include extra metrics if the user explicitly asks for:
 - mix %
 - contribution %
 - transaction count
+
+EXCEPTION — Invoice / Revenue Type Split:
+Tax amount is ALWAYS included when user asks for any type split / invoice split / revenue split.
+It is a core component of the split definition, not an extra metric.
 """
 
 
@@ -397,7 +399,7 @@ currencies, and inter-company collections.
 
 Grain:
 One row per payment-to-invoice link. A single payment may link to multiple invoices,
-producing multiple rows per payment_id. Vice-versa multiple payments can link to one invoice.
+producing multiple rows per payment_id.
 
 Important filters:
 - inter_company_status = 'T' means inter-company collection.
