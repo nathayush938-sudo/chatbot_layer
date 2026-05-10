@@ -42,6 +42,11 @@ def format_currency_value(x, currency, decimals=2):
 
 QUARTER_SORT_KEYWORDS = ["quarter", "fy", "month", "year", "date", "period"]
 
+AGEING_ORDER = [
+    'Within CP', '1-15 days', '16-30 days', '31-45 days',
+    '46-60 days', '61-90 days', '>90 days'
+]
+
 def strip_currency_suffix(name):
     """Remove redundant currency labels from column headers."""
     for suffix in [" (USD)", " (INR)", " (usd)", " (inr)", " (Usd)", " (Inr)"]:
@@ -182,32 +187,37 @@ def apply_display_formatting(df, metadata):
 def add_pivot_totals_and_sort(pivot_df, row_cols):
     numeric_cols = pivot_df.select_dtypes(include="number").columns.tolist()
 
+    pivot_df = pivot_df.copy()
     pivot_df["Total"] = pivot_df[numeric_cols].sum(axis=1)
 
     grand_total_value = pivot_df["Total"].sum()
-
     pivot_df["Row %"] = pivot_df["Total"].apply(
         lambda x: x / grand_total_value if grand_total_value else 0
     )
 
-    pivot_df = pivot_df.sort_values(
-        by="Total",
-        ascending=False
-    )
+    # Sort: chronological for time dimensions, by Total DESC for everything else
+    # reset_index so index is clean before appending Grand Total
+    if row_cols and is_time_column(row_cols[0]):
+        pivot_df = pivot_df.sort_values(by=row_cols[0], ascending=True).reset_index(drop=True)
+    else:
+        pivot_df = pivot_df.sort_values(by="Total", ascending=False).reset_index(drop=True)
 
+    # Build Grand Total row and append via pd.concat (avoids index corruption)
     grand_total = {}
-
     for col in pivot_df.columns:
         if col in row_cols:
             grand_total[col] = "Grand Total"
         elif col == "Row %":
-            grand_total[col] = 1
+            grand_total[col] = 1.0
         elif pd.api.types.is_numeric_dtype(pivot_df[col]):
             grand_total[col] = pivot_df[col].sum()
         else:
             grand_total[col] = ""
 
-    pivot_df.loc[len(pivot_df)] = grand_total
+    pivot_df = pd.concat(
+        [pivot_df, pd.DataFrame([grand_total])],
+        ignore_index=True
+    )
 
     return pivot_df
 
@@ -216,6 +226,7 @@ def format_pivot_values(pivot_df, metadata, row_cols):
     display  = metadata.get("display", {})
     currency = display.get("currency", "USD")
 
+    # ── Format values ────────────────────────────────────────────────────
     for col in pivot_df.columns:
         if col == "Row %":
             pivot_df[col] = pivot_df[col].apply(
@@ -226,23 +237,20 @@ def format_pivot_values(pivot_df, metadata, row_cols):
                 lambda x: format_currency_value(x, currency)
             )
 
-    # Explicit column order for dimension pivots:
-    # row dimension(s) | Row % | value columns | Total
-    special = set(row_cols + ["Row %", "Total"])
+    # ── Column order: row dim(s) | Row % | value cols | Total ────────────
+    special    = set(row_cols + ["Row %", "Total"])
     value_cols = [c for c in pivot_df.columns if c not in special]
+
+    # Enforce ageing bucket order when applicable
+    ageing_in_vals = [c for c in AGEING_ORDER if c in value_cols]
+    if ageing_in_vals:
+        other_vals = [c for c in value_cols if c not in AGEING_ORDER]
+        value_cols = ageing_in_vals + other_vals
+
     row_pct   = ["Row %"] if "Row %" in pivot_df.columns else []
     total_col = ["Total"] if "Total" in pivot_df.columns else []
     ordered   = row_cols + row_pct + value_cols + total_col
     pivot_df  = pivot_df[[c for c in ordered if c in pivot_df.columns]]
-
-    # Sort rows: chronological for time dimensions, by Total DESC otherwise
-    # Exclude Grand Total row from sort, re-append after
-    grand_mask  = pivot_df[row_cols[0]].astype(str).str.contains("Grand Total", case=False, na=False) if row_cols else pd.Series([False] * len(pivot_df))
-    body        = pivot_df[~grand_mask]
-    grand_rows  = pivot_df[grand_mask]
-    if row_cols and is_time_column(row_cols[0]):
-        body = body.sort_values(by=row_cols[0], ascending=True)
-    pivot_df = pd.concat([body, grand_rows], ignore_index=True)
 
     return pivot_df
 
@@ -371,6 +379,81 @@ def apply_metric_pivot_formatting(df, metadata):
         df             = df.rename(columns={row_label: combined})
 
     return df
+
+
+
+def apply_ageing_pivot_formatting(pivot_df, metadata, row_cols):
+    """
+    Cumulative ageing pivot:
+    For each dimension row (e.g. quarter), renders two rows:
+      1. Collection amounts per ageing bucket  +  Row Total  +  Row %
+      2. Cumulative % sub-row (running % across buckets)
+    Followed by Grand Total + Total (Cumulative %) rows.
+    """
+    display  = metadata.get("display", {})
+    currency = display.get("currency", "INR")
+    row_dim  = row_cols[0] if row_cols else pivot_df.columns[0]
+
+    # Only include buckets that actually exist in data, in logical order
+    ageing_cols = [c for c in AGEING_ORDER if c in pivot_df.columns]
+
+    # Numeric row total for sorting
+    pivot_df = pivot_df.copy()
+    pivot_df['_row_total'] = pivot_df[ageing_cols].sum(axis=1)
+
+    if is_time_column(row_dim):
+        pivot_df = pivot_df.sort_values(by=row_dim, ascending=True).reset_index(drop=True)
+    else:
+        pivot_df = pivot_df.sort_values(by='_row_total', ascending=False).reset_index(drop=True)
+
+    grand_total = pivot_df['_row_total'].sum()
+    result_rows = []
+
+    for _, row in pivot_df.iterrows():
+        row_total = float(row['_row_total'])
+        row_pct   = row_total / grand_total if grand_total else 0
+
+        # ── Amount row ──────────────────────────────────────────────────
+        amt = {row_dim: str(row[row_dim])}
+        for col in ageing_cols:
+            amt[col] = format_currency_value(float(row[col]), currency)
+        amt['Row Total'] = format_currency_value(row_total, currency)
+        amt['Row %']     = f"**{row_pct:.1%}**"   # bold for emphasis
+        result_rows.append(amt)
+
+        # ── Cumulative % sub-row ────────────────────────────────────────
+        cum = {row_dim: f"{row[row_dim]} (Cumulative %)"}
+        running = 0.0
+        for col in ageing_cols:
+            running += float(row[col]) if isinstance(row[col], (int, float)) else 0
+            cum[col] = f"{running / row_total:.1%}" if row_total else "0.0%"
+        cum['Row Total'] = "100.0%"
+        cum['Row %']     = ""
+        result_rows.append(cum)
+
+    # ── Grand Total row ─────────────────────────────────────────────────
+    gt = {row_dim: 'Grand Total'}
+    gt_cum = {row_dim: 'Total (Cumulative %)'}
+    running_gt = 0.0
+    for col in ageing_cols:
+        col_sum     = float(pivot_df[col].sum())
+        gt[col]     = format_currency_value(col_sum, currency)
+        running_gt += col_sum
+        gt_cum[col] = f"{running_gt / grand_total:.1%}" if grand_total else "0.0%"
+    gt['Row Total']     = format_currency_value(grand_total, currency)
+    gt['Row %']         = "**100.0%**"
+    gt_cum['Row Total'] = "100.0%"
+    gt_cum['Row %']     = ""
+    result_rows.extend([gt, gt_cum])
+
+    result_df = pd.DataFrame(result_rows)
+
+    # Final column order
+    col_order = [row_dim] + ageing_cols + ['Row Total', 'Row %']
+    result_df = result_df[[c for c in col_order if c in result_df.columns]]
+    result_df = result_df.fillna("")
+
+    return result_df
 
 
 user_input = st.chat_input("Ask something")
