@@ -81,6 +81,18 @@ Sorting Rules:
 
 - Do not default to alphabetical ordering unless explicitly requested.
 
+Limit Rules:
+- For "top N" or "bottom N" requests, always add LIMIT N to the query.
+- Do not use subqueries or ROW_NUMBER() for simple top N ranking; use ORDER BY + LIMIT.
+- If the user asks for a ranked/top/bottom report but does not mention a number, apply LIMIT 10 by default.
+- If the user asks for the "full list", "all customers", "all regions", or similar, do not apply any LIMIT.
+- Examples:
+    "top 5 customers"         → LIMIT 5
+    "top customers"           → LIMIT 10 (default)
+    "bottom 3 regions"        → ORDER BY metric ASC LIMIT 3
+    "all customers"           → no LIMIT
+    "full list of customers"  → no LIMIT
+
 Important TYPE SPLIT RULES:
 When user says:
 - billing type split
@@ -243,6 +255,18 @@ SORTING RULES:
 - For ageing bucket reports: ORDER BY ageingbucket using the CASE WHEN sort defined above.
 - For top/bottom reports: always order by metric DESC.
 - Do not default to alphabetical ordering unless explicitly requested.
+
+LIMIT RULES:
+- For "top N" or "bottom N" requests, always add LIMIT N to the query.
+- Do not use subqueries or ROW_NUMBER() for simple top N ranking; use ORDER BY + LIMIT.
+- If the user asks for a ranked/top/bottom report but does not mention a number, apply LIMIT 10 by default.
+- If the user asks for the "full list", "all customers", "all regions", or similar, do not apply any LIMIT.
+- Examples:
+    "top 5 customers"         → LIMIT 5
+    "top customers"           → LIMIT 10 (default)
+    "bottom 3 regions"        → ORDER BY metric ASC LIMIT 3
+    "all customers"           → no LIMIT
+    "full list of customers"  → no LIMIT
 
 REPORT STRUCTURE RULES:
 1. One dimension only:
