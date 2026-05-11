@@ -107,10 +107,13 @@ Currency Rules:
 - Always calculate reporting currency amounts inside SQL using exchange rate columns.
 
 Metric Conversion Rules:
-- Billed revenue in USD: SUM(billed_amt * usd_exchangerate) AS billed_revenue_usd
-- Billed revenue in INR: SUM(billed_amt * inr_exchangerate) AS billed_revenue_inr
-- Billed tax in USD: SUM(billed_tax_amt * usd_exchangerate) AS billed_tax_usd
-- Billed tax in INR: SUM(billed_tax_amt * inr_exchangerate) AS billed_tax_inr
+- billed_amt already includes tax. Default metric is billed_amt with no deduction.
+- Billed revenue (default / including tax) in USD: SUM(billed_amt * usd_exchangerate) AS billed_revenue_usd
+- Billed revenue (default / including tax) in INR: SUM(billed_amt * inr_exchangerate) AS billed_revenue_inr
+- Billed revenue EXCLUDING tax in USD: SUM((billed_amt - COALESCE(billed_tax_amt,0)) * usd_exchangerate) AS billed_revenue_excl_tax_usd
+- Billed revenue EXCLUDING tax in INR: SUM((billed_amt - COALESCE(billed_tax_amt,0)) * inr_exchangerate) AS billed_revenue_excl_tax_inr
+- Tax amount only in USD: SUM(COALESCE(billed_tax_amt,0) * usd_exchangerate) AS tax_amount_usd
+- Tax amount only in INR: SUM(COALESCE(billed_tax_amt,0) * inr_exchangerate) AS tax_amount_inr
 - Subscription revenue in USD: SUM(subscriptionfee * usd_exchangerate) AS subscription_revenue_usd
 - Subscription revenue in INR: SUM(subscriptionfee * inr_exchangerate) AS subscription_revenue_inr
 - Implementation revenue in USD: SUM(implementationfee * usd_exchangerate) AS implementation_revenue_usd

@@ -14,18 +14,37 @@ DEFAULT RULES:
 - Default billing filter is external customers only: inter_company_status = 'F'.
 - For intercompany billing, use inter_company_status = 'T'.
 
+TAX IN BILLING:
+- Billing does NOT have a tds_flag column. Never use tds_flag in billing queries.
+- Tax in billing is represented by the billed_tax_amt column — a metric, not a filter.
+- If user says "excluding tax" in billing → simply do not include billed_tax_amt in SELECT.
+- If user says "including tax" or asks for tax → include billed_tax_amt as a metric.
+- No WHERE clause filtering is needed for tax in billing.
+
 METRICS:
-1. Billing / billed revenue / billed amount / revenue:
+1. Billing / billed revenue / billed amount / revenue (DEFAULT — tax already included):
+   billed_amt already includes tax. Default is to report as-is.
    USD: SUM(billed_amt * usd_exchangerate) AS billed_revenue_usd
    INR: SUM(billed_amt * inr_exchangerate) AS billed_revenue_inr
 
-2. Tax / tax amount:
+2. Billed revenue EXCLUDING tax (only when user says "excluding tax" / "ex-tax" / "net of tax"):
+   Deduct billed_tax_amt from billed_amt inside the SUM.
+   USD: SUM((billed_amt - COALESCE(billed_tax_amt,0)) * usd_exchangerate) AS billed_revenue_excl_tax_usd
+   INR: SUM((billed_amt - COALESCE(billed_tax_amt,0)) * inr_exchangerate) AS billed_revenue_excl_tax_inr
+
+3. Tax amount only (only when user explicitly asks for tax amount / tax split):
    USD: SUM(COALESCE(billed_tax_amt, 0) * usd_exchangerate) AS tax_amount_usd
    INR: SUM(COALESCE(billed_tax_amt, 0) * inr_exchangerate) AS tax_amount_inr
-   IMPORTANT: always use COALESCE(billed_tax_amt, 0) to handle NULL tax values.
-   Always use the full alias tax_amount_usd or tax_amount_inr — never just tax_amount.
+   Always use COALESCE(billed_tax_amt, 0) to handle NULL tax values.
    Always include "tax_amount_usd": "Tax Amount" or "tax_amount_inr": "Tax Amount"
    in display.columns.
+
+TAX RULES FOR BILLING:
+- billed_amt already contains tax. Default = SUM(billed_amt * rate). No filter needed.
+- "including tax" / "with tax" → same as default, no change.
+- "excluding tax" / "ex-tax" / "net of tax" → use formula: billed_amt - COALESCE(billed_tax_amt,0)
+- Never use tds_flag in billing. Billing has no tds_flag column.
+- Never add billed_tax_amt separately unless user explicitly asks for tax amount.
 
 3. Subscription revenue:
    USD: SUM(subscriptionfee * usd_exchangerate) AS subscription_revenue_usd
@@ -273,8 +292,9 @@ DEFAULT RULES:
 - If user asks INR or does not mention currency, use INR.
 - collection_amt is in transaction currency. Always convert using exchange rate columns.
 - Default filter: inter_company_status = 'F' (external customers only).
-- TDS is INCLUDED by default. Only exclude TDS when user explicitly asks for
-  "net collections", "collections excluding tax", or "excluding TDS".
+- TDS is EXCLUDED by default: always add tds_flag = 'F' unless user explicitly asks for
+  "tax included", "including TDS", or "gross collections".
+  Collections represent net amounts received after TDS deduction.
 - For intercompany collections, use inter_company_status = 'T'.
 
 METRICS:
@@ -296,25 +316,27 @@ METRICS:
    Filter: tds_flag = 'T' (only TDS rows)
 
 TDS TERMINOLOGY DISAMBIGUATION:
+
+DEFAULT BEHAVIOUR (no TDS mention):
+→ Always apply tds_flag = 'F' (net collections). This is the standard business view.
+
 - "TDS deducted" / "net of TDS" / "after TDS" / "excluding TDS" / "TDS-deducted"
   / "total minus TDS" / "collections TDS deducted" / "tax-deducted" / "tax deducted"
   / "collections, tax-deducted" / "collections net" / "net collection"
-  → ALL mean net collections → ONE metric only → filter tds_flag = 'F'
-  → Do NOT return both total_collections and tds_amount together
+  → net collections → tds_flag = 'F' (same as default, explicit confirmation)
 
-- "TDS amount" / "TDS collected" / "show TDS" / "only TDS" / "tax deducted at source"
-  / "show me TDS" / "how much TDS"
-  → mean the TDS component only → ONE metric → filter tds_flag = 'T'
+- "tax included" / "including TDS" / "gross collections" / "before TDS"
+  / "all collections including tax"
+  → OVERRIDE default → remove tds_flag filter → include all rows
 
-- "gross collections" / "total collections" / "all collections" (with no TDS mention)
-  → include all rows → no tds_flag filter
+- "TDS amount" / "show TDS" / "only TDS" / "how much TDS" / "tax deducted at source"
+  → TDS component only → tds_flag = 'T'
 
 - "total collections and TDS" / "collections with TDS breakup" / "show both"
-  → TWO metrics: total_collections_inr (no tds filter) + tds_amount_inr (tds_flag = 'T')
+  → TWO metrics: collection_inr (tds_flag = 'F') + tds_amount_inr (tds_flag = 'T')
 
-CRITICAL: If the user uses "tax-deducted" or "TDS-deducted" as a QUALIFIER after
-"total collections", treat it as a filter (net collections), NOT as a second metric.
-"total collections, tax-deducted" = net collections only = tds_flag = 'F', ONE column.
+CRITICAL: If the user uses "tax-deducted" as a qualifier, it confirms the default —
+ONE metric, tds_flag = 'F'. Do NOT add a second TDS column.
 
 DIMENSIONS:
 - region / region wise = region_name
@@ -417,8 +439,9 @@ REPORT STRUCTURE RULES:
    Use billing_entity and billed_entity dimensions.
    Example: dimension pivot with rows = billing_entity, columns = billed_entity.
 
-7. Net collections / excluding TDS:
-   Add tds_flag = 'F' to WHERE clause.
+7. Collections (default):
+   Always apply tds_flag = 'F'. No need to add explicitly — it is the default.
+   Only remove when user says "tax included" or "gross collections".
 
 8. Currency mix:
    Group by txn_currency_symbol (and optionally fy_quarter for QoQ).
