@@ -144,10 +144,19 @@ def apply_display_formatting(df, metadata):
             "decimals": 1
         }
 
-        # Sort: chronological ASC for time dimensions, value DESC for everything else
+        # Sort: ageing order → chronological ASC → value DESC
         dim_cols = [c for c in df.columns if not is_metric_column(c) and c != "Row %"]
-        if dim_cols and is_time_column(dim_cols[0]):
-            df = df.sort_values(by=dim_cols[0], ascending=True).reset_index(drop=True)
+        if dim_cols:
+            sample_vals = df[dim_cols[0]].astype(str).tolist()
+            is_ageing   = any(v in AGEING_ORDER for v in sample_vals)
+            if is_ageing:
+                order_map   = {v: i for i, v in enumerate(AGEING_ORDER)}
+                df["_sort"] = df[dim_cols[0]].map(lambda x: order_map.get(x, len(AGEING_ORDER)))
+                df = df.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
+            elif is_time_column(dim_cols[0]):
+                df = df.sort_values(by=dim_cols[0], ascending=True).reset_index(drop=True)
+            else:
+                df = df.sort_values(by=value_col, ascending=False).reset_index(drop=True)
         else:
             df = df.sort_values(by=value_col, ascending=False).reset_index(drop=True)
 
@@ -195,12 +204,23 @@ def add_pivot_totals_and_sort(pivot_df, row_cols):
         lambda x: x / grand_total_value if grand_total_value else 0
     )
 
-    # Sort: chronological for time dimensions, by Total DESC for everything else
-    # reset_index so index is clean before appending Grand Total
-    if row_cols and is_time_column(row_cols[0]):
-        pivot_df = pivot_df.sort_values(by=row_cols[0], ascending=True).reset_index(drop=True)
-    else:
-        pivot_df = pivot_df.sort_values(by="Total", ascending=False).reset_index(drop=True)
+    # Sort: ageing order → chronological → value DESC
+    if row_cols:
+        sample_vals = pivot_df[row_cols[0]].astype(str).tolist()
+        is_ageing_rows = any(v in AGEING_ORDER for v in sample_vals)
+
+        if is_ageing_rows:
+            # Enforce logical ageing bucket order in rows
+            order_map  = {v: i for i, v in enumerate(AGEING_ORDER)}
+            pivot_df   = pivot_df.copy()
+            pivot_df["_sort"] = pivot_df[row_cols[0]].map(
+                lambda x: order_map.get(x, len(AGEING_ORDER))
+            )
+            pivot_df = pivot_df.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
+        elif is_time_column(row_cols[0]):
+            pivot_df = pivot_df.sort_values(by=row_cols[0], ascending=True).reset_index(drop=True)
+        else:
+            pivot_df = pivot_df.sort_values(by="Total", ascending=False).reset_index(drop=True)
 
     # Build Grand Total row and append via pd.concat (avoids index corruption)
     grand_total = {}

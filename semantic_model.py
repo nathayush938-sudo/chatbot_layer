@@ -192,6 +192,12 @@ COMMON DASHBOARD REPORTS:
 7. Intercompany Billing:
    dimension pivot with rows = billingentity, columns = billedentity, values = billed amount, filter inter_company_status = 'T'.
 
+ID COLUMN RULES:
+- Never SELECT customer_id, subsidiary_id, or any internal ID column unless the user
+  explicitly asks for it (e.g. "show me customer IDs" or "include the ID").
+- For customer-level reports, SELECT only customer_name — not customer_id.
+- ID columns are internal identifiers and clutter the display.
+
 DIMENSION VALIDATION:
 Valid billing dimensions (only these can be used in GROUP BY):
   region_name, customer_name, customer_id, fy_quarter,
@@ -205,6 +211,12 @@ If the user mentions a word that is NOT in this list as a grouping dimension:
 - Set explanation to clearly state: "'<word>' is not a valid dimension.
   Valid dimensions are: region, customer, quarter, currency, subsidiary, etc."
 - Still generate the best possible SQL (e.g. overall total if no valid dimension given).
+
+ID COLUMN RULES:
+- Never SELECT customer_id, subsidiary_id, or any internal ID column unless the user
+  explicitly asks for it.
+- For customer-level reports, SELECT only customer_name — not customer_id.
+- ID columns are internal identifiers and clutter the display.
 
 DIMENSION VALIDATION:
 Valid collections dimensions (only these can be used in GROUP BY):
