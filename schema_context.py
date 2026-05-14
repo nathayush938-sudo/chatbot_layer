@@ -1,144 +1,82 @@
 BILLING_CONTEXT = """
 Table/View name: billing
 
-Default Currency:
-USD
+Default Currency: USD
 
 Business purpose:
-This view contains invoice and credit note billing data. It is used to analyze billed revenue, billed tax, invoice splits, customers, regions, subsidiaries, currencies, and inter-company billing.
+Invoice and credit note billing data. Analyse billed revenue, tax, invoice type splits,
+customers, regions, subsidiaries, currencies, and inter-company billing.
 
-Grain:
-One row per billing transaction/invoice/credit note.
+Grain: One row per billing transaction (CustInvc or CustCred).
 
-Important filters:
-- inter_company_status = 'T' means inter-company transaction.
-- inter_company_status = 'F' means external customer transaction.
+Default filter: inter_company_status = 'F'.
 
 Columns:
-
-billing_id:
-Unique transaction ID for the billing transaction.
-
-txntobaseexchangerate:
-Exchange rate from transaction currency to base currency.
-
-billed_tax_amt:
-Tax amount in transaction currency.
-
-billed_amt:
-Total billed amount in transaction currency.
-
-subscriptionfee:
-Subscription revenue component in transaction currency.
-
-implementationfee:
-Implementation revenue component in transaction currency.
-
-integrationfee:
-Integration revenue component in transaction currency.
-
-studiofee:
-Studio revenue component in transaction currency.
-
-otherservicesfee:
-Other services revenue component in transaction currency.
-
-openingsplitfee:
-Opening split revenue component in transaction currency.
-
-amsfee:
-AMS revenue component in transaction currency.
-
-billing_number:
-Invoice or credit note number.
-
-billing_date:
-Billing transaction date.
-
-fy_quarter:
-Financial year quarter, example FY26 Q1.
-
-customer_id:
-Customer/entity ID.
-
-customer_name:
-Customer name.
-
-region_name:
-Standard mapped region name.
-
-txn_currency_id:
-Transaction currency ID.
-
-txn_currency_symbol:
-Transaction currency symbol.
-
-inr_exchangerate:
-Exchange rate used to convert transaction currency to INR.
-
-usd_exchangerate:
-Exchange rate used to convert transaction currency to USD.
-
-subsidiary_id:
-Subsidiary ID (internal use only, do not expose in reports).
-
-billingentity:
-Billing entity / billing subsidiary. Always use this column for billing entity grouping.
-Never use subsidiary_name.
-
-billedentity:
-Billed entity.
-
-subsidiary_country:
-Billing subsidiary country.
-
-inter_company_status:
-T if inter-company transaction, F if external customer transaction.
+transaction_id: Unique internal ID of the billing transaction.
+transaction_number: Human-readable transaction number (e.g. INV-00123).
+transaction_type: CustInvc or CustCred.
+transaction_currency_id: ID of transaction currency.
+transaction_date: Date the transaction was created.
+duedate: Due date of the invoice.
+transaction_amount: Total amount in transaction currency. Also aliased as billing_amount.
+billing_amount: Same as transaction_amount. Primary metric column for billing.
+transaction_amount_paid: Amount paid so far.
+transaction_amount_unpaid: Amount still outstanding.
+transaction_tax: Tax amount in transaction currency. Use COALESCE(transaction_tax,0).
+transaction_exchange_rate: Base exchange rate (used internally for fee calculations).
+memo: Transaction memo field.
+transaction_fy_quarter: FY quarter of transaction date. Example: FY26 Q1, FY27 Q2.
+inr_exchangerate: Rate from transaction currency to INR.
+usd_exchangerate: Rate from transaction currency to USD.
+customer_id: Internal customer ID.
+customer_ucc: Unique customer code.
+customer_name: Customer company name.
+ucc_parent: UCC of parent company.
+entity_id: Customer entity ID.
+region: Mapped region name of the customer.
+country: Country of the customer.
+client_journey_stage: Churned, Customer Success, Implementation, One Time, Potential Churn.
+client_buckets: Churned Account, Non-Issue, Issue.
+collection_status: Collection follow-up status.
+subsidiary_id: ID of billing subsidiary.
+subsidiary_name: Name of billing entity / subsidiary.
+paying_entity: Paying entity name (intercompany only).
+currency_symbol: Symbol of transaction currency.
+inter_company_status: T = intercompany, F = external.
+subscriptionfee: Subscription revenue in transaction currency.
+implementationfee: Implementation revenue in transaction currency.
+integrationfee: Integration revenue in transaction currency.
+studiofee: Studio revenue in transaction currency.
+otherservicesfee: Other services revenue in transaction currency.
+openingsplitfee: Opening split revenue in transaction currency.
+amsfee: AMS revenue in transaction currency.
 
 Currency Rules:
-- All amount, tax, and fee columns are stored in transaction currency.
-- To report in USD, multiply the transaction currency amount by usd_exchangerate.
-- To report in INR, multiply the transaction currency amount by inr_exchangerate.
-- Billing default reporting currency is USD.
-- If user does not specify currency, report in USD.
-- If user asks for INR, use INR conversion.
-- If user asks for USD, use USD conversion.
-- Never use billed_amt_usd, billed_amt_inr, billed_tax_amt_usd, or billed_tax_amt_inr because these columns do not exist.
-- Always calculate reporting currency amounts inside SQL using exchange rate columns.
+- All amount, tax, and fee columns are in transaction currency.
+- USD: multiply by usd_exchangerate. INR: multiply by inr_exchangerate.
+- Default: USD. Never use pre-computed currency columns.
 
 Metric Conversion Rules:
-- billed_amt already includes tax. Default metric is billed_amt with no deduction.
-- Billed revenue (default / including tax) in USD: SUM(billed_amt * usd_exchangerate) AS billed_revenue_usd
-- Billed revenue (default / including tax) in INR: SUM(billed_amt * inr_exchangerate) AS billed_revenue_inr
-- Billed revenue EXCLUDING tax in USD: SUM((billed_amt - COALESCE(billed_tax_amt,0)) * usd_exchangerate) AS billed_revenue_excl_tax_usd
-- Billed revenue EXCLUDING tax in INR: SUM((billed_amt - COALESCE(billed_tax_amt,0)) * inr_exchangerate) AS billed_revenue_excl_tax_inr
-- Tax amount only in USD: SUM(COALESCE(billed_tax_amt,0) * usd_exchangerate) AS tax_amount_usd
-- Tax amount only in INR: SUM(COALESCE(billed_tax_amt,0) * inr_exchangerate) AS tax_amount_inr
-- Subscription revenue in USD: SUM(subscriptionfee * usd_exchangerate) AS subscription_revenue_usd
-- Subscription revenue in INR: SUM(subscriptionfee * inr_exchangerate) AS subscription_revenue_inr
-- Implementation revenue in USD: SUM(implementationfee * usd_exchangerate) AS implementation_revenue_usd
-- Implementation revenue in INR: SUM(implementationfee * inr_exchangerate) AS implementation_revenue_inr
-- Integration revenue in USD: SUM(integrationfee * usd_exchangerate) AS integration_revenue_usd
-- Integration revenue in INR: SUM(integrationfee * inr_exchangerate) AS integration_revenue_inr
-- Studio revenue in USD: SUM(studiofee * usd_exchangerate) AS studio_revenue_usd
-- Studio revenue in INR: SUM(studiofee * inr_exchangerate) AS studio_revenue_inr
-- Other services revenue in USD: SUM((COALESCE(amsfee,0) + COALESCE(otherservicesfee,0) + COALESCE(openingsplitfee,0)) * usd_exchangerate) AS other_services_revenue_usd
-- Other services revenue in INR: SUM((COALESCE(amsfee,0) + COALESCE(otherservicesfee,0) + COALESCE(openingsplitfee,0)) * inr_exchangerate) AS other_services_revenue_inr
+- Billed revenue (incl tax) USD: SUM(billing_amount * usd_exchangerate) AS billed_revenue_usd
+- Billed revenue (incl tax) INR: SUM(billing_amount * inr_exchangerate) AS billed_revenue_inr
+- Billed revenue excl tax USD: SUM((billing_amount - COALESCE(transaction_tax,0)) * usd_exchangerate) AS billed_revenue_excl_tax_usd
+- Billed revenue excl tax INR: SUM((billing_amount - COALESCE(transaction_tax,0)) * inr_exchangerate) AS billed_revenue_excl_tax_inr
+- Tax USD: SUM(COALESCE(transaction_tax,0) * usd_exchangerate) AS tax_amount_usd
+- Tax INR: SUM(COALESCE(transaction_tax,0) * inr_exchangerate) AS tax_amount_inr
+- Subscription USD: SUM(subscriptionfee * usd_exchangerate) AS subscription_revenue_usd
+- Implementation USD: SUM(implementationfee * usd_exchangerate) AS implementation_revenue_usd
+- Integration USD: SUM(integrationfee * usd_exchangerate) AS integration_revenue_usd
+- Studio USD: SUM(studiofee * usd_exchangerate) AS studio_revenue_usd
+- Other services USD: SUM((COALESCE(amsfee,0)+COALESCE(otherservicesfee,0)+COALESCE(openingsplitfee,0)) * usd_exchangerate) AS other_services_revenue_usd
 
-Common query rules:
-- For external customer reporting, filter inter_company_status = 'F'.
-- For inter-company reporting, filter inter_company_status = 'T'.
-- If user does not mention inter-company, default to inter_company_status = 'F'.
-- For invoice type split, use subscription, implementation, integration, studio, and other services.
-- Other Services = amsfee + otherservicesfee + openingsplitfee.
-- For quarterly analysis, group by fy_quarter.
-- For customer-level analysis, group by customer_name and customer_id.
-- For region-level analysis, group by region_name.
-- For subsidiary-level analysis, group by subsidiary_name.
-- For billing currency analysis, group by txn_currency_symbol.
-- Use PostgreSQL syntax only.
-- Only generate SELECT queries.
-- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE.
+Common Query Rules:
+- Default: inter_company_status = 'F'.
+- Quarterly: GROUP BY transaction_fy_quarter.
+- Region: GROUP BY region.
+- Subsidiary: GROUP BY subsidiary_name.
+- Currency: GROUP BY currency_symbol.
+- Only SELECT. Never INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE.
+- PostgreSQL syntax only.
 """
 
 STRICT_METRIC_SELECTION_RULES = """
@@ -157,12 +95,12 @@ User:
 "Show billing by transaction currency mix"
 
 Correct:
-- transaction currency
-- billed revenue only
+- currency_symbol (dimension)
+- billed revenue only: SUM(billing_amount * usd_exchangerate)
 
 Wrong:
 - transaction count
-- billed tax
+- tax amount
 - averages
 - percentages
 
@@ -170,14 +108,14 @@ User:
 "Show billing by currency with tax"
 
 Correct:
-- billed revenue
-- billed tax
+- billed revenue: SUM(billing_amount * usd_exchangerate)
+- tax amount: SUM(COALESCE(transaction_tax,0) * usd_exchangerate)
 
 User:
 "Show billing by region"
 
 Correct:
-- billed revenue only
+- billed revenue only: SUM(billing_amount * usd_exchangerate)
 
 Only include extra metrics if the user explicitly asks for:
 - count
@@ -188,7 +126,7 @@ Only include extra metrics if the user explicitly asks for:
 - contribution %
 - transaction count
 
-EXCEPTION — Invoice / Revenue Type Split:
+EXCEPTION - Invoice / Revenue Type Split:
 Tax amount is ALWAYS included when user asks for any type split / invoice split / revenue split.
 It is a core component of the split definition, not an extra metric.
 """
@@ -267,12 +205,12 @@ Rules:
 
 Example SQL:
 SELECT
-    region_name,
-    fy_quarter,
-    SUM(billed_amt * usd_exchangerate) AS billed_revenue_usd
+    region,
+    transaction_fy_quarter,
+    SUM(billing_amount * usd_exchangerate) AS billed_revenue_usd
 FROM billing
 WHERE inter_company_status = 'F'
-GROUP BY region_name, fy_quarter
+GROUP BY region, transaction_fy_quarter
 
 -----------------------------------
 2. METRIC PIVOT
@@ -330,7 +268,7 @@ Rules:
 
 Example SQL:
 SELECT
-    region_name,
+    region,
     SUM(subscriptionfee * usd_exchangerate) AS subscription_revenue_usd,
     SUM(implementationfee * usd_exchangerate) AS implementation_revenue_usd,
     SUM(integrationfee * usd_exchangerate) AS integration_revenue_usd,
@@ -338,7 +276,7 @@ SELECT
     SUM((COALESCE(amsfee,0) + COALESCE(otherservicesfee,0) + COALESCE(openingsplitfee,0)) * usd_exchangerate) AS other_services_revenue_usd
 FROM billing
 WHERE inter_company_status = 'F'
-GROUP BY region_name
+GROUP BY region
 
 -----------------------------------
 DISPLAY RULES
@@ -358,8 +296,8 @@ Example display object:
   "title": "Billing by Region and Quarter",
   "currency": "USD",
   "columns": {
-    "region_name": "Region",
-    "fy_quarter": "Financial Quarter",
+    "region": "Region",
+    "transaction_fy_quarter": "Financial Quarter",
     "billed_revenue_usd": "Billed Revenue (USD)"
   },
   "formatting": {
@@ -392,149 +330,156 @@ GENERAL RULES
 COLLECTIONS_CONTEXT = """
 Table/View name: collections
 
-Default Currency:
-INR
+Default Currency: INR
 
 Business purpose:
-This view contains payment/collection data linked to invoices. It is used to analyze
-collected amounts, collection timelines, ageing buckets, customers, regions, subsidiaries,
-currencies, and inter-company collections.
+Payment/collection data linked to invoices. Analyse collected amounts, collection timelines,
+ageing buckets, customers, regions, subsidiaries, and inter-company collections.
 
-Grain:
-One row per payment-to-invoice link. A single payment may link to multiple invoices,
-producing multiple rows per payment_id.
+Grain: One row per payment-to-invoice link.
 
-Important filters:
-- inter_company_status = 'T' means inter-company collection.
-- inter_company_status = 'F' means external customer collection.
-- tds_flag = 'T' means the collection entry is a TDS (tax deducted at source) payment.
-- tds_flag = 'F' means a regular collection.
-
-Default filters to ALWAYS apply unless user explicitly overrides:
-- inter_company_status = 'F'  (exclude intercompany)
-- tds_flag is NOT filtered by default; include all collections unless user asks for
-  "net collections", "excluding TDS", or "collections excluding tax", in which case
-  add tds_flag = 'F'.
+Default filters: inter_company_status = 'F' AND tds_flag = 'F'.
 
 Columns:
-
-payment_id:
-Transaction ID of the payment.
-
-payment_number:
-Transaction number of the payment.
-
-payment_date:
-Date of payment.
-
-txn_currency_id:
-ID of the transaction currency.
-
-txn_currency_symbol:
-Symbol of the transaction currency.
-
-inr_exchangerate:
-Exchange rate from transaction currency to INR.
-
-usd_exchangerate:
-Exchange rate from transaction currency to USD.
-
-subsidiary_id:
-ID of the billing subsidiary.
-
-subsidiary_country:
-Country of the billing subsidiary.
-
-collection_amt:
-Collection amount in transaction currency.
-
-invoice_id:
-Transaction ID of the invoice from which the collection is made.
-
-customer_id:
-ID of the customer.
-
-customer_name:
-Name of the customer.
-
-inter_company_status:
-'T' if inter-company collection, 'F' if external customer collection.
-
-invoice_date:
-Date when the invoice was raised.
-
-due_date:
-Date when the invoice was due.
-
-invoice_number:
-Transaction number of the invoice.
-
-tds_flag:
-'T' if this collection entry is a TDS/tax payment, 'F' if a regular collection.
-
-ageingbucket:
-Ageing timeline of the collection relative to invoice due date.
-Valid values in sort order:
-  'Within CP'   → paid on or before due date
-  '1-15 days'   → 1 to 15 days late
-  '16-30 days'  → 16 to 30 days late
-  '31-45 days'  → 31 to 45 days late
-  '46-60 days'  → 46 to 60 days late
-  '61-90 days'  → 61 to 90 days late
-  '>90 days'    → more than 90 days late
-
-fy_quarter:
-Financial year and quarter of the payment date, example FY26 Q1.
-
-region_name:
-Standard mapped region name of the customer.
-
-billing_entity:
-Name of the billing subsidiary (entity raising the invoice).
-
-billed_entity:
-Name of the paying entity. Use only for intercompany transactions.
+transaction_id: Unique internal ID of the collection/payment transaction.
+transaction_number: Human-readable transaction number.
+transaction_type: CustPymt, Deposit, or Journal.
+transaction_currency_id: ID of transaction currency.
+transaction_date: Date of the payment/collection.
+duedate: Due date of the payment transaction.
+transaction_amount: Total of the payment transaction (one payment may cover multiple invoices).
+transaction_amount_paid: Amount paid.
+transaction_amount_unpaid: Amount unpaid.
+transaction_tax: Tax on the transaction.
+memo: Memo field (used to derive tds_flag).
+transaction_fy_quarter: FY quarter of payment date. Example: FY26 Q1.
+collection_due_date: Due date of the linked invoice.
+collection_amount: Amount applied to this specific invoice. USE THIS for all metrics.
+inr_exchangerate: Rate from transaction currency to INR.
+usd_exchangerate: Rate from transaction currency to USD.
+customer_id: Internal customer ID.
+customer_ucc: Unique customer code.
+customer_name: Customer company name.
+ucc_parent: UCC of parent company.
+entity_id: Customer entity ID.
+region: Mapped region name of the customer.
+country: Country of the customer.
+client_journey_stage: Churned, Customer Success, Implementation, One Time, Potential Churn.
+client_buckets: Churned Account, Non-Issue, Issue.
+collection_status: Collection follow-up status.
+subsidiary_id: ID of billing subsidiary.
+subsidiary_name: Name of billing entity / subsidiary.
+paying_entity: Paying entity name (intercompany only).
+currency_symbol: Symbol of transaction currency.
+inter_company_status: T = intercompany, F = external.
+tds_flag: T = TDS payment (memo contains 'tds'), F = regular collection.
+ageingbucket: Ageing relative to invoice due date.
+  Values (in order): 'Within CP', '1-15 days', '16-30 days', '31-45 days',
+  '46-60 days', '61-90 days', '>90 days'
 
 Currency Rules:
-- collection_amt is stored in transaction currency.
-- To report in INR: collection_amt * inr_exchangerate
-- To report in USD: collection_amt * usd_exchangerate
-- Default reporting currency is INR.
-- If user does not specify currency, report in INR.
-- If user asks for USD, use USD conversion.
-- Never use pre-computed collection_amt_inr or collection_amt_usd columns;
-  always compute inside SQL using exchange rate columns.
+- collection_amount is in transaction currency.
+- INR: collection_amount * inr_exchangerate. USD: collection_amount * usd_exchangerate.
+- Default: INR. Never use pre-computed currency columns.
 
 Metric Conversion Rules:
-- Collections in INR: SUM(collection_amt * inr_exchangerate) AS collection_inr
-- Collections in USD: SUM(collection_amt * usd_exchangerate) AS collection_usd
-- Net collections in INR (TDS excluded): SUM(collection_amt * inr_exchangerate) AS net_collection_inr WHERE tds_flag = 'F'
-- Net collections in USD (TDS excluded): SUM(collection_amt * usd_exchangerate) AS net_collection_usd WHERE tds_flag = 'F'
+- Net collections INR (default): SUM(collection_amount * inr_exchangerate) WHERE tds_flag = 'F'
+- Net collections USD: SUM(collection_amount * usd_exchangerate) WHERE tds_flag = 'F'
+- Gross collections INR (incl TDS): SUM(collection_amount * inr_exchangerate)
+- TDS amount INR: SUM(collection_amount * inr_exchangerate) WHERE tds_flag = 'T'
 
 Common Query Rules:
-- For external customer reporting, filter inter_company_status = 'F'.
-- For inter-company reporting, filter inter_company_status = 'T'.
-- If user does not mention inter-company, default to inter_company_status = 'F'.
-- For net / excluding-TDS collections, add tds_flag = 'F'.
-- For quarterly analysis, group by fy_quarter.
-- For ageing analysis, group by ageingbucket. Sort by the defined bucket order, not alphabetically.
-- For customer-level analysis, group by customer_name and customer_id.
-- For region-level analysis, group by region_name.
-- For subsidiary-level analysis, group by billing_entity.
-- For currency analysis, group by txn_currency_symbol.
-- Use PostgreSQL syntax only.
-- Only generate SELECT queries.
-- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, or TRUNCATE.
+- Default: inter_company_status = 'F' AND tds_flag = 'F'.
+- Quarterly: GROUP BY transaction_fy_quarter.
+- Ageing: GROUP BY ageingbucket (never sort alphabetically).
+- Region: GROUP BY region.
+- Subsidiary: GROUP BY subsidiary_name.
+- Currency: GROUP BY currency_symbol.
+- Only SELECT. Never INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE.
+- PostgreSQL syntax only.
+"""
 
-Ageing Bucket Sort Order:
-When ordering by ageingbucket, use CASE WHEN to enforce logical order:
-CASE ageingbucket
-  WHEN 'Within CP'  THEN 1
-  WHEN '1-15 days'  THEN 2
-  WHEN '16-30 days' THEN 3
-  WHEN '31-45 days' THEN 4
-  WHEN '46-60 days' THEN 5
-  WHEN '61-90 days' THEN 6
-  WHEN '>90 days'   THEN 7
-END
+
+# ─────────────────────────────────────────────
+# ACCOUNTS RECEIVABLE (AR)
+AR_CONTEXT = """
+Table/View name: ar
+
+Default Currency: USD
+
+Business purpose:
+Open AR transactions - invoices, credit notes, and payments representing the net outstanding
+receivable position as of today.
+
+Grain: One row per open transaction. open_amount is signed (positive=invoice, negative=credit).
+SUM(open_amount) gives net AR naturally.
+
+Default filter: inter_company_status = 'F'.
+AR is a real-time snapshot - no time-period WHERE filtering.
+transaction_fy_quarter is a GROUP BY dimension only (invoice creation quarter).
+
+Columns:
+transaction_id: Unique internal ID.
+transaction_number: Human-readable transaction number.
+transaction_type: CustInvc, CustCred, CustPymt, Deposit, Journal.
+transaction_currency_id: ID of transaction currency.
+transaction_date: Date transaction was created.
+duedate: Due date of the invoice.
+transaction_amount: Total amount of the transaction.
+transaction_amount_paid: Amount paid so far.
+transaction_amount_unpaid: Amount still outstanding.
+transaction_tax: Tax on the transaction.
+transaction_fy_quarter: FY quarter the transaction was raised. GROUP BY only, never WHERE.
+inr_exchangerate: Rate from transaction currency to INR.
+usd_exchangerate: Rate from transaction currency to USD.
+customer_id: Internal customer ID.
+customer_ucc: Unique customer code.
+customer_name: Customer company name.
+ucc_parent: UCC of parent company.
+entity_id: Customer entity ID.
+region: Mapped region name of the customer.
+country: Country of the customer.
+client_journey_stage: Churned, Customer Success, Implementation, One Time, Potential Churn.
+client_buckets: Churned Account, Non-Issue, Issue.
+collection_status: Collection follow-up status.
+subsidiary_id: ID of billing subsidiary.
+subsidiary_name: Name of billing entity / subsidiary.
+paying_entity: Paying entity name (intercompany only).
+currency_symbol: Symbol of transaction currency.
+inter_company_status: T = intercompany, F = external.
+open_days: CURRENT_DATE - COALESCE(duedate, transaction_date). Positive = overdue.
+open_amount: Net open amount in transaction currency. Positive=invoice, negative=credit.
+
+Currency Rules:
+- open_amount is in transaction currency.
+- USD: open_amount * usd_exchangerate. INR: open_amount * inr_exchangerate.
+- Default: USD. Never use pre-computed currency columns.
+
+Metric Definitions:
+- Net Outstanding USD: SUM(open_amount * usd_exchangerate)
+- Overdue USD: SUM(open_amount * usd_exchangerate) WHERE open_days >= 1
+- Current USD: SUM(open_amount * usd_exchangerate) WHERE open_days < 1
+
+Ageing Bucket Definitions:
+- Current: open_days < 1
+- 1-30 days: open_days BETWEEN 1 AND 30
+- 31-60 days: open_days BETWEEN 31 AND 60
+- 61-90 days: open_days BETWEEN 61 AND 90
+- 91-180 days: open_days BETWEEN 91 AND 180
+- >180 days: open_days > 180
+
+Ageing Bucket SQL (wide format, USD default):
+SUM(CASE WHEN open_days < 1 THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket_current_usd,
+SUM(CASE WHEN open_days BETWEEN 1 AND 30 THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket_1_30_usd,
+SUM(CASE WHEN open_days BETWEEN 31 AND 60 THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket_31_60_usd,
+SUM(CASE WHEN open_days BETWEEN 61 AND 90 THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket_61_90_usd,
+SUM(CASE WHEN open_days BETWEEN 91 AND 180 THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket_91_180_usd,
+SUM(CASE WHEN open_days > 180 THEN open_amount * usd_exchangerate ELSE 0 END) AS bucket_over_180_usd
+
+Common Query Rules:
+- Always filter inter_company_status = 'F' unless user asks for intercompany.
+- AR is always as of today - no time-period WHERE filtering.
+- transaction_fy_quarter: GROUP BY only.
+- No tds_flag in AR.
+- PostgreSQL syntax only. Only SELECT queries.
 """

@@ -9,6 +9,27 @@ st.set_page_config(
 
 st.title("Finance AI Chatbot")
 
+# ── Session state initialisation ─────────────────────────────────────────────
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []   # API context: [{"user":..,"assistant":..}]
+if "exchanges" not in st.session_state:
+    st.session_state.exchanges = []      # Display: list of rendered exchange dicts
+if "raw_values" not in st.session_state:
+    st.session_state.raw_values = False
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.header("Display Settings")
+    st.session_state.raw_values = st.toggle(
+        "Show raw values",
+        value=st.session_state.raw_values,
+        help="Switch between formatted (₹11.85 Cr / $75.83 Mn) and full unformatted numbers"
+    )
+    if st.session_state.raw_values:
+        st.caption("Showing full unformatted numbers")
+    else:
+        st.caption("Showing abbreviated formatted values")
+
 BACKEND_URL = "http://127.0.0.1:8000/chat"
 
 
@@ -25,13 +46,16 @@ def get_currency_symbol(currency):
 
 def format_currency_value(x, currency, decimals=2):
     """
-    Formats a numeric value into abbreviated currency:
-      INR → ₹1.23 Cr   (divided by 1 Crore = 10,000,000)
-      USD → $1.23 Mn   (divided by 1 Million = 1,000,000)
+    Formats a numeric value.
+    Formatted mode (default): ₹1.23 Cr / $1.23 Mn
+    Raw mode (toggle on):     1,23,00,000 (full number, no symbol, commas only)
     Returns empty string for null/non-numeric values.
     """
     if not isinstance(x, (int, float)) or not pd.notnull(x):
         return ""
+    # Raw mode — full unformatted number with thousand separators
+    if st.session_state.get("raw_values", False):
+        return f"{x:,.0f}"
     symbol   = get_currency_symbol(currency)
     currency = (currency or "").upper()
     if currency == "INR":
@@ -40,12 +64,26 @@ def format_currency_value(x, currency, decimals=2):
         return f"{symbol}{x / 1_000_000:,.{decimals}f} Mn"
 
 
-QUARTER_SORT_KEYWORDS = ["quarter", "fy", "month", "year", "date", "period"]
+QUARTER_SORT_KEYWORDS = ["quarter", "fy", "month", "year", "date", "period", "annual"]
 
 AGEING_ORDER = [
     'Within CP', '1-15 days', '16-30 days', '31-45 days',
     '46-60 days', '61-90 days', '>90 days'
 ]
+
+AR_AGEING_ORDER = [
+    'Current', '1-30 days', '31-60 days',
+    '61-90 days', '91-180 days', '>180 days'
+]
+
+# Combined order for detection across both collections and AR
+ALL_AGEING_VALUES = set(AGEING_ORDER + AR_AGEING_ORDER)
+
+def is_id_column(col):
+    """Returns True if column looks like an internal ID (should go last / not be summed)."""
+    c = col.lower()
+    return c.endswith("_id") or c == "id" or c.endswith(" id")
+
 
 def strip_currency_suffix(name):
     """Remove redundant currency labels from column headers."""
@@ -59,10 +97,16 @@ def is_time_column(col):
     return any(kw in col_lower for kw in QUARTER_SORT_KEYWORDS)
 
 def is_metric_column(col):
-    col = col.lower()
-    return any(word in col for word in [
+    col_lower = col.lower()
+    # Exclude known dimension column names even if they contain metric keywords
+    # e.g. "Billing Entity", "Collection Status", "Client Bucket"
+    dimension_exclusions = ["entity", "status", "bucket", "journey", "region",
+                            "currency", "country", "subsidiary"]
+    if any(pat in col_lower for pat in dimension_exclusions):
+        return False
+    return any(word in col_lower for word in [
         "amount", "revenue", "billing", "billed", "tax", "fee", "total",
-        "collection", "receipt"
+        "collection", "receipt", "outstanding", "overdue"
     ])
 
 
@@ -119,6 +163,68 @@ def reorder_columns(df):
     return df[ordered_cols]
 
 
+def apply_detail_formatting(df, metadata):
+    """
+    Formats a detail/drilldown table (individual rows, no GROUP BY).
+    Works with SELECT * — auto-detects and formats amount columns.
+    Column order: non-IDs in SQL order, IDs last.
+    No Row %, no Grand Total.
+    """
+    display    = metadata.get("display", {})
+    column_map = {k: strip_currency_suffix(v)
+                  for k, v in display.get("columns", {}).items()}
+    currency   = display.get("currency", "INR")
+    formatting = display.get("formatting", {})
+
+    df = df.rename(columns=column_map)
+
+    # Apply explicit formatting from metadata
+    for original_col, rule in formatting.items():
+        mapped_col = strip_currency_suffix(column_map.get(original_col, original_col))
+        if mapped_col not in df.columns:
+            continue
+        if rule.get("type") == "currency":
+            df[mapped_col] = df[mapped_col].apply(
+                lambda x: format_currency_value(x, currency)
+            )
+        elif rule.get("type") == "percentage":
+            decimals = rule.get("decimals", 1)
+            df[mapped_col] = df[mapped_col].apply(
+                lambda x: f"{x:.{decimals}%}"
+                if isinstance(x, (int, float)) and pd.notnull(x) else ""
+            )
+
+    # Auto-format numeric columns not already formatted by metadata
+    # Amount/fee columns → format as currency; exchange rate cols → round to 4dp
+    formatted_cols = {strip_currency_suffix(column_map.get(c, c)) for c in formatting}
+    amount_keywords = ["amount", "fee", "billing_amount", "collection_amount",
+                       "open_amount", "transaction_amount", "tax"]
+    rate_keywords   = ["exchangerate", "exchange_rate"]
+
+    for col in df.columns:
+        if col in formatted_cols:
+            continue
+        col_lower = col.lower()
+        if any(k in col_lower for k in amount_keywords):
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].apply(
+                    lambda x: format_currency_value(x, currency)
+                )
+        elif any(k in col_lower for k in rate_keywords):
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].apply(
+                    lambda x: f"{x:.4f}" if isinstance(x, (int, float)) and pd.notnull(x) else ""
+                )
+
+    # IDs last — keep everything else in SQL column order
+    cols    = df.columns.tolist()
+    id_cols = [c for c in cols if is_id_column(c)]
+    non_ids = [c for c in cols if c not in id_cols]
+    df = df[non_ids + id_cols]
+
+    return df
+
+
 def apply_display_formatting(df, metadata):
     display = metadata.get("display", {})
     column_map = display.get("columns", {})
@@ -132,44 +238,76 @@ def apply_display_formatting(df, metadata):
     ]
 
     if metric_candidates:
-        value_col = metric_candidates[-1]
-        total_value = df[value_col].sum()
-
-        df["Row %"] = df[value_col].apply(
-            lambda x: x / total_value if total_value else 0
+        # Primary sort column — prefer "outstanding", then "total", then last metric
+        sort_col = next(
+            (c for c in metric_candidates if "outstanding" in c.lower()),
+            next((c for c in metric_candidates if "total" in c.lower()),
+                 metric_candidates[-1])
         )
 
-        formatting["Row %"] = {
-            "type": "percentage",
-            "decimals": 1
-        }
+        # Detect dual-metric: both outstanding and overdue present
+        outstanding_col = next((c for c in metric_candidates if "outstanding" in c.lower()), None)
+        overdue_col     = next((c for c in metric_candidates if "overdue" in c.lower()), None)
+
+        if outstanding_col and overdue_col and pd.api.types.is_numeric_dtype(df[outstanding_col]):
+            # Add Outstanding % and Overdue % columns (each as % of their own grand total)
+            total_outstanding = df[outstanding_col].sum()
+            total_overdue     = df[overdue_col].sum()
+            df["Outstanding %"] = df[outstanding_col].apply(
+                lambda x: x / total_outstanding
+                if isinstance(x, (int, float)) and pd.notnull(x) and total_outstanding else 0
+            )
+            df["Overdue %"] = df[overdue_col].apply(
+                lambda x: x / total_overdue
+                if isinstance(x, (int, float)) and pd.notnull(x) and total_overdue else 0
+            )
+            formatting["Outstanding %"] = {"type": "percentage", "decimals": 0}
+            formatting["Overdue %"]     = {"type": "percentage", "decimals": 0}
+
+        # Row % only makes sense for single-metric tables
+        if len(metric_candidates) == 1:
+            value_col   = metric_candidates[0]
+            total_value = df[value_col].sum()
+            df["Row %"] = df[value_col].apply(
+                lambda x: x / total_value if (isinstance(x, (int, float)) and total_value) else 0
+            )
+            formatting["Row %"] = {"type": "percentage", "decimals": 1}
+            sort_col = value_col
 
         # Sort: ageing order → chronological ASC → value DESC
         dim_cols = [c for c in df.columns if not is_metric_column(c) and c != "Row %"]
         if dim_cols:
             sample_vals = df[dim_cols[0]].astype(str).tolist()
-            is_ageing   = any(v in AGEING_ORDER for v in sample_vals)
+            is_ageing   = any(v in ALL_AGEING_VALUES for v in sample_vals)
             if is_ageing:
-                order_map   = {v: i for i, v in enumerate(AGEING_ORDER)}
+                active_order = AR_AGEING_ORDER if any(v in AR_AGEING_ORDER for v in sample_vals) else AGEING_ORDER
+                order_map   = {v: i for i, v in enumerate(active_order)}
                 df["_sort"] = df[dim_cols[0]].map(lambda x: order_map.get(x, len(AGEING_ORDER)))
                 df = df.sort_values("_sort").drop(columns=["_sort"]).reset_index(drop=True)
             elif is_time_column(dim_cols[0]):
                 df = df.sort_values(by=dim_cols[0], ascending=True).reset_index(drop=True)
             else:
-                df = df.sort_values(by=value_col, ascending=False).reset_index(drop=True)
+                df = df.sort_values(by=sort_col, ascending=False).reset_index(drop=True)
         else:
-            df = df.sort_values(by=value_col, ascending=False).reset_index(drop=True)
+            df = df.sort_values(by=sort_col, ascending=False).reset_index(drop=True)
 
-        # Grand Total row — numeric cols summed, others left blank
-        grand_row = {}
-        for col in df.columns:
-            if col == "Row %":
-                grand_row[col] = 1.0
-            elif pd.api.types.is_numeric_dtype(df[col]):
-                grand_row[col] = df[col].sum()
-            else:
-                grand_row[col] = "Grand Total" if col == df.columns[0] else ""
-        df.loc[len(df)] = grand_row
+        # Grand Total row
+        # Ratio columns (overdue as % of outstanding) can't be summed
+        ratio_cols = [c for c in df.columns
+                      if "pct_of" in c.lower() or "as % of" in c.lower()]
+
+        if len(df) > 1:
+            grand_row = {}
+            for col in df.columns:
+                if col == "Row %":
+                    grand_row[col] = 1.0
+                elif is_id_column(col) or col in ratio_cols:
+                    grand_row[col] = ""   # never sum IDs or ratios
+                elif pd.api.types.is_numeric_dtype(df[col]):
+                    grand_row[col] = df[col].sum()
+                else:
+                    grand_row[col] = "Grand Total" if col == df.columns[0] else ""
+            df = pd.concat([df, pd.DataFrame([grand_row])], ignore_index=True)
 
     for original_col, rule in formatting.items():
         if original_col in df.columns:
@@ -183,7 +321,8 @@ def apply_display_formatting(df, metadata):
                 decimals = rule.get("decimals", 1)
 
                 df[original_col] = df[original_col].apply(
-                    lambda x: f"{x:.{decimals}%}" if pd.notnull(x) else ""
+                    lambda x: f"{x:.{decimals}%}"
+                    if isinstance(x, (int, float)) and pd.notnull(x) else ""
                 )
 
     clean_map = {k: strip_currency_suffix(v) for k, v in column_map.items()}
@@ -207,11 +346,12 @@ def add_pivot_totals_and_sort(pivot_df, row_cols):
     # Sort: ageing order → chronological → value DESC
     if row_cols:
         sample_vals = pivot_df[row_cols[0]].astype(str).tolist()
-        is_ageing_rows = any(v in AGEING_ORDER for v in sample_vals)
+        is_ageing_rows = any(v in ALL_AGEING_VALUES for v in sample_vals)
 
         if is_ageing_rows:
-            # Enforce logical ageing bucket order in rows
-            order_map  = {v: i for i, v in enumerate(AGEING_ORDER)}
+            # Pick the right order list based on which values are present
+            active_order = AR_AGEING_ORDER if any(v in AR_AGEING_ORDER for v in sample_vals) else AGEING_ORDER
+            order_map  = {v: i for i, v in enumerate(active_order)}
             pivot_df   = pivot_df.copy()
             pivot_df["_sort"] = pivot_df[row_cols[0]].map(
                 lambda x: order_map.get(x, len(AGEING_ORDER))
@@ -263,7 +403,11 @@ def format_pivot_values(pivot_df, metadata, row_cols):
 
     # Enforce ageing bucket order when applicable
     ageing_in_vals = [c for c in AGEING_ORDER if c in value_cols]
-    if ageing_in_vals:
+    ar_ageing_in_vals = [c for c in AR_AGEING_ORDER if c in value_cols]
+    if ar_ageing_in_vals:
+        other_vals = [c for c in value_cols if c not in AR_AGEING_ORDER]
+        value_cols = ar_ageing_in_vals + other_vals
+    elif ageing_in_vals:
         other_vals = [c for c in value_cols if c not in AGEING_ORDER]
         value_cols = ageing_in_vals + other_vals
 
@@ -415,7 +559,12 @@ def apply_ageing_pivot_formatting(pivot_df, metadata, row_cols):
     row_dim  = row_cols[0] if row_cols else pivot_df.columns[0]
 
     # Only include buckets that actually exist in data, in logical order
-    ageing_cols = [c for c in AGEING_ORDER if c in pivot_df.columns]
+    # Auto-detect which ageing order applies
+    if any(c in AR_AGEING_ORDER for c in pivot_df.columns):
+        active_ageing_order = AR_AGEING_ORDER
+    else:
+        active_ageing_order = AGEING_ORDER
+    ageing_cols = [c for c in active_ageing_order if c in pivot_df.columns]
 
     # Numeric row total for sorting
     pivot_df = pivot_df.copy()
@@ -478,6 +627,142 @@ def apply_ageing_pivot_formatting(pivot_df, metadata, row_cols):
 
 user_input = st.chat_input("Ask something")
 
+def render_exchange(exchange):
+    """Re-render a stored exchange (user + assistant response)."""
+    with st.chat_message("user"):
+        st.write(exchange["user_input"])
+
+    if exchange.get("error"):
+        with st.chat_message("assistant"):
+            st.warning(exchange["error"])
+        return
+
+    result   = exchange["result"]
+    metadata = result["metadata"]
+    data     = result["data"]
+    df       = pd.DataFrame(data)
+
+    with st.chat_message("assistant"):
+        display     = metadata.get("display", {})
+        title       = display.get("title")
+        explanation = metadata.get("explanation", "")
+
+        if title:       st.subheader(title)
+        if explanation: st.write(explanation)
+
+        with st.expander("Generated SQL"):
+            st.code(metadata.get("sql", ""), language="sql")
+
+        render_result(df, metadata, result)
+
+        with st.expander("Token usage"):
+            st.json(result.get("usage", {}))
+
+    # ── Store exchange in session state ─────────────────────────────────────
+    st.session_state.exchanges.append({
+        "user_input": user_input,
+        "result":     result,
+        "error":      None,
+    })
+
+    # Full session history — all turns kept, including domain for context-aware routing
+    st.session_state.chat_history.append({
+        "user":      user_input,
+        "assistant": result.get("assistant_summary", ""),
+        "domain":    result.get("domain", "billing"),
+    })
+
+
+def render_result(df, metadata, result):
+    """Core rendering logic — shared between live and replay."""
+    display       = metadata.get("display", {})
+    visualization = metadata.get("visualization")
+
+    if metadata.get("metric_columns"):
+        visualization           = "pivot_table"
+        metadata["pivot_type"]  = "metric"
+
+    try:
+        if visualization == "pivot_table" and metadata.get("pivot_type") == "metric":
+            df = apply_metric_pivot_formatting(df, metadata)
+            st.dataframe(df, width='stretch', hide_index=True)
+
+        elif visualization == "pivot_table" and metadata.get("pivot_type") == "dimension":
+            rows        = metadata["rows"]
+            columns     = metadata["columns"]
+            values      = metadata["values"][0]
+            aggregation = metadata.get("aggregation", "sum")
+
+            pivot_df = df.pivot_table(
+                index=rows, columns=columns, values=values,
+                aggfunc=aggregation, fill_value=0
+            ).reset_index()
+            pivot_df.columns = [str(col) for col in pivot_df.columns]
+
+            column_map   = {k: strip_currency_suffix(v)
+                            for k, v in display.get("columns", {}).items()}
+            pivot_df     = pivot_df.rename(columns=column_map)
+            renamed_rows = [column_map.get(row, row) for row in rows]
+
+            row_label = column_map.get(rows[0], rows[0]) if rows else ""
+            col_label = column_map.get(columns[0], columns[0]) if columns else ""
+            if row_label and col_label:
+                combined_header = f"{row_label} ↓  |  {col_label} →"
+                pivot_df        = pivot_df.rename(columns={row_label: combined_header})
+                renamed_rows    = [combined_header if r == row_label else r
+                                   for r in renamed_rows]
+
+            ageing_cols_in_pivot = [c for c in AGEING_ORDER if c in pivot_df.columns]
+            ar_ageing_in_pivot   = [c for c in AR_AGEING_ORDER if c in pivot_df.columns]
+
+            if ageing_cols_in_pivot or ar_ageing_in_pivot:
+                pivot_df = apply_ageing_pivot_formatting(pivot_df, metadata, renamed_rows)
+            else:
+                pivot_df = add_pivot_totals_and_sort(pivot_df, renamed_rows)
+                pivot_df = format_pivot_values(pivot_df, metadata, renamed_rows)
+
+            st.dataframe(pivot_df, width='stretch', hide_index=True)
+
+        else:
+            sql_lower = metadata.get("sql", "").lower()
+            is_detail = "group by" not in sql_lower
+            if is_detail and len(df) > 1:
+                df = apply_detail_formatting(df, metadata)
+                st.dataframe(df, width='stretch', hide_index=True)
+            elif len(df) == 1:
+                display_meta = metadata.get("display", {})
+                currency     = display_meta.get("currency", "USD")
+                col_map      = {k: strip_currency_suffix(v)
+                                for k, v in display_meta.get("columns", {}).items()}
+                numeric_cols = df.select_dtypes(include="number").columns.tolist()
+                metric_cols  = [c for c in numeric_cols if is_metric_column(c)]
+                if metric_cols:
+                    kpi_cols = st.columns(len(metric_cols))
+                    for i, col in enumerate(metric_cols):
+                        label = strip_currency_suffix(col_map.get(col, col))
+                        value = format_currency_value(float(df[col].iloc[0]), currency)
+                        kpi_cols[i].metric(label=label, value=value)
+                else:
+                    df = apply_display_formatting(df, metadata)
+                    st.dataframe(df, width='stretch', hide_index=True)
+            else:
+                df = apply_display_formatting(df, metadata)
+                st.dataframe(df, width='stretch', hide_index=True)
+
+    except Exception as render_err:
+        st.error(f"Rendering error: {render_err}")
+        with st.expander("Debug — raw metadata from Claude"):
+            st.json(metadata)
+        with st.expander("Debug — raw data columns"):
+            st.write(list(df.columns))
+
+
+# ── Replay previous exchanges ─────────────────────────────────────────────────
+for exchange in st.session_state.exchanges:
+    render_exchange(exchange)
+
+
+# ── New input ─────────────────────────────────────────────────────────────────
 if user_input:
     with st.chat_message("user"):
         st.write(user_input)
@@ -486,7 +771,10 @@ if user_input:
     try:
         response = requests.post(
             BACKEND_URL,
-            json={"message": user_input},
+            json={
+                "message": user_input,
+                "history": st.session_state.chat_history,
+            },
             timeout=300
         )
     except requests.exceptions.ReadTimeout:
@@ -578,8 +866,15 @@ if user_input:
                 st.dataframe(pivot_df, width='stretch', hide_index=True)
 
             else:
+                # Detect detail query: no GROUP BY in SQL → use detail formatter
+                sql_lower = metadata.get("sql", "").lower()
+                is_detail = "group by" not in sql_lower
+
+                if is_detail and len(df) > 1:
+                    df = apply_detail_formatting(df, metadata)
+                    st.dataframe(df, width='stretch', hide_index=True)
                 # Single-row result → show as KPI cards instead of a table
-                if len(df) == 1:
+                elif len(df) == 1:
                     display_meta = metadata.get("display", {})
                     currency     = display_meta.get("currency", "USD")
                     col_map      = {k: strip_currency_suffix(v)

@@ -12,10 +12,11 @@ import os
 from schema_context import (
     BILLING_CONTEXT,
     COLLECTIONS_CONTEXT,
+    AR_CONTEXT,
     PRESENTATION_RULES,
     STRICT_METRIC_SELECTION_RULES,
 )
-from semantic_model import BILLING_SEMANTIC_MODEL, COLLECTIONS_SEMANTIC_MODEL
+from semantic_model import BILLING_SEMANTIC_MODEL, COLLECTIONS_SEMANTIC_MODEL, AR_SEMANTIC_MODEL
 
 app = FastAPI()
 
@@ -28,17 +29,15 @@ engine = create_engine(database_url) if database_url else None
 
 def get_fy_info() -> dict:
     """
-    Computes Indian financial year (April-March) boundaries.
-    Returns labels and ISO date strings for current and previous FY.
+    Computes Indian financial year (April-March) context.
+    Available data: FY25, FY26, FY27 (YTD).
+    Default = current FY YTD.
 
     Indian FY quarters:
-      Q1 = April   - June       (months 4-6)
-      Q2 = July    - September  (months 7-9)
-      Q3 = October - December   (months 10-12)
-      Q4 = January - March      (months 1-3)
-
-    Default reporting period = previous complete FY (data is always complete).
-    Current FY = YTD only, used when user explicitly asks for YTD or current year.
+      Q1 = April - June      (months 4-6)
+      Q2 = July  - September (months 7-9)
+      Q3 = Oct   - December  (months 10-12)
+      Q4 = Jan   - March     (months 1-3)
     """
     today = date.today()
 
@@ -47,27 +46,30 @@ def get_fy_info() -> dict:
     else:
         cur_end_year = today.year
 
-    current_fy  = f"FY{str(cur_end_year)[-2:]}"
-    previous_fy = f"FY{str(cur_end_year - 1)[-2:]}"
+    current_fy  = f"FY{str(cur_end_year)[-2:]}"       # e.g. FY27
+    previous_fy = f"FY{str(cur_end_year - 1)[-2:]}"   # e.g. FY26
+    two_yrs_ago = f"FY{str(cur_end_year - 2)[-2:]}"   # e.g. FY25
 
-    cur_fy_start  = date(cur_end_year - 1, 4, 1)
-    cur_fy_end    = date(cur_end_year, 3, 31)
-    prev_fy_start = date(cur_end_year - 2, 4, 1)
-    prev_fy_end   = date(cur_end_year - 1, 3, 31)
+    # Current quarter in Indian FY
+    month_to_q  = {4:1, 5:1, 6:1, 7:2, 8:2, 9:2, 10:3, 11:3, 12:3, 1:4, 2:4, 3:4}
+    cur_q       = month_to_q[today.month]
+    current_quarter = f"{current_fy} Q{cur_q}"
+    last_quarter    = (f"{previous_fy} Q4" if cur_q == 1
+                       else f"{current_fy} Q{cur_q - 1}")
 
     return {
-        "current_fy":    current_fy,
-        "previous_fy":   previous_fy,
-        "cur_fy_start":  cur_fy_start.isoformat(),
-        "cur_fy_end":    cur_fy_end.isoformat(),
-        "prev_fy_start": prev_fy_start.isoformat(),
-        "prev_fy_end":   prev_fy_end.isoformat(),
-        "today":         today.isoformat(),
+        "current_fy":       current_fy,
+        "previous_fy":      previous_fy,
+        "two_years_ago_fy": two_yrs_ago,
+        "current_quarter":  current_quarter,
+        "last_quarter":     last_quarter,
+        "today":            today.isoformat(),
     }
 
 
 class ChatRequest(BaseModel):
     message: str
+    history: list = []   # list of {"user": str, "assistant": str} dicts
 
 
 TOOLS = [
@@ -145,95 +147,168 @@ TOOLS = [
 # DOMAIN ROUTING
 # ─────────────────────────────────────────────
 
+AR_KEYWORDS = [
+    "ar", "a/r", "accounts receivable", "receivable", "receivables",
+    "outstanding", "overdue", "open invoice", "open invoices",
+    "open amount", "unpaid invoice", "unpaid", "days outstanding", "open days",
+    "collection status", "client bucket", "client journey", "customer journey",
+    "client journey stage", "cjs",
+    "ar ageing", "ar aging", "invoice ageing", "invoice aging",
+    "outstanding invoice", "due invoice", "pending invoice",
+    "total ar", "total outstanding", "total overdue",
+    "ucc", "customer ucc", "paying entity",
+]
+
 COLLECTION_KEYWORDS = [
     "collection", "collections", "collected",
     "receipt", "receipts",
     "payment received", "payments received",
-    "outstanding", "overdue",
     "ageing", "aging", "age bucket", "ageing bucket", "aging bucket",
     "dso", "days sales outstanding",
     "tds", "tax deducted",
     "net collection", "net collections",
     "delay", "delayed", "days late",
-    "due date", "past due",
+    "collection due", "past due",
     "collection by", "collect",
+    "within cp", "credit period",
 ]
 
 BILLING_KEYWORDS = [
-    "billing", "billed", "bill",
-    "invoice", "invoiced",
-    "revenue",
-    "subscription fee", "implementation fee",
-    "integration fee", "studio fee",
-    "other service",
-    "billed amount", "billed revenue",
+    # Specific billing terms — NOT "billing" alone (ambiguous with "billing entity")
+    "billed", "billed revenue", "billed amount",
+    "invoice type", "invoice split", "revenue split",
+    "subscription revenue", "implementation revenue",
+    "integration revenue", "studio revenue",
     "subscriptionfee", "implementationfee",
+    "integrationfee", "studiofee", "amsfee",
+    "credit note",
+]
+
+# Terms that appear in ALL domains — never use for routing
+NEUTRAL_PHRASES = [
+    "billing entity", "billing subsidiary",
+    "subsidiary", "paying entity", "billed entity",
 ]
 
 
-def classify_domain(message: str) -> str:
+def classify_domain(message: str, history: list = []) -> str:
     """
-    Returns 'collections' or 'billing' based on keyword scoring.
-    Collections keywords take priority over billing when scores are tied
-    because billing is the legacy domain and collections is the new one.
-    Defaults to 'billing' if no keywords match.
+    Returns 'ar', 'collections', or 'billing' based on keyword scoring.
+    AR is checked first as it has the most distinct keywords.
+    Neutral phrases (billing entity, subsidiary) are excluded from scoring.
+    Falls back to the last domain from conversation history when score is ambiguous.
+    Defaults to 'billing' if no keywords match and no history exists.
     """
     msg = message.lower()
 
-    collection_score = sum(1 for kw in COLLECTION_KEYWORDS if kw in msg)
-    billing_score = sum(1 for kw in BILLING_KEYWORDS if kw in msg)
+    # Strip neutral phrases so they don't skew domain detection
+    for phrase in NEUTRAL_PHRASES:
+        msg = msg.replace(phrase, "")
 
-    if collection_score > billing_score:
+    ar_score         = sum(1 for kw in AR_KEYWORDS if kw in msg)
+    collection_score = sum(1 for kw in COLLECTION_KEYWORDS if kw in msg)
+    billing_score    = sum(1 for kw in BILLING_KEYWORDS if kw in msg)
+
+    # Strong AR signal
+    if ar_score > 0 and ar_score >= collection_score and ar_score >= billing_score:
+        return "ar"
+
+    # Strong collections signal
+    if collection_score > billing_score and collection_score > ar_score:
         return "collections"
+
+    # Strong billing signal
+    if billing_score > 0:
+        return "billing"
+
+    # No strong signal — fall back to last domain from conversation history
+    if history:
+        for turn in reversed(history):
+            if turn.get("domain"):
+                return turn["domain"]
+
+    # Default
     return "billing"
 
 
 def build_system_prompt(domain: str) -> str:
     fy = get_fy_info()
 
-    # Quarter date boundaries for dynamic filtering (Indian FY)
-    # These let Claude filter by specific quarters using the date column
-    # instead of the hardcoded fy_quarter string column.
-    quarter_ranges = f"""
-Indian FY Quarter Date Ranges (for dynamic filtering):
-  Q1 = April 1  to June 30
-  Q2 = July 1   to September 30
-  Q3 = October 1 to December 31
-  Q4 = January 1 to March 31
-
-To filter a specific quarter, compute the calendar year from the FY label:
-  FY{fy["previous_fy"][2:]} Q1 = {fy["prev_fy_start"][:4]}-04-01 to {fy["prev_fy_start"][:4]}-06-30
-  FY{fy["previous_fy"][2:]} Q2 = {fy["prev_fy_start"][:4]}-07-01 to {fy["prev_fy_start"][:4]}-09-30
-  FY{fy["previous_fy"][2:]} Q3 = {fy["prev_fy_start"][:4]}-10-01 to {fy["prev_fy_start"][:4]}-12-31
-  FY{fy["previous_fy"][2:]} Q4 = {fy["prev_fy_end"][:4]}-01-01  to {fy["prev_fy_end"]}
-  FY{fy["current_fy"][2:]} Q1  = {fy["cur_fy_start"][:4]}-04-01 to {fy["cur_fy_start"][:4]}-06-30
-  FY{fy["current_fy"][2:]} Q2  = {fy["cur_fy_start"][:4]}-07-01 to {fy["cur_fy_start"][:4]}-09-30
-  FY{fy["current_fy"][2:]} Q3  = {fy["cur_fy_start"][:4]}-10-01 to {fy["cur_fy_start"][:4]}-12-31
-  FY{fy["current_fy"][2:]} Q4  = {fy["cur_fy_end"][:4]}-01-01  to {fy["cur_fy_end"]}
-"""
-
     date_and_time_rules = f"""
 Financial Year Context (computed at runtime):
-  Current FY  : {fy["current_fy"]}  ({fy["cur_fy_start"]} to {fy["cur_fy_end"]})
-  Previous FY : {fy["previous_fy"]} ({fy["prev_fy_start"]} to {fy["prev_fy_end"]})
-  Today       : {fy["today"]}
+  Current FY      : {fy["current_fy"]}  (YTD — available but year not complete)
+  Previous FY     : {fy["previous_fy"]} (full year)
+  Two FYs ago     : {fy["two_years_ago_fy"]} (full year)
+  Current Quarter : {fy["current_quarter"]}
+  Last Quarter    : {fy["last_quarter"]}
+  Today           : {fy["today"]}
+  Available data  : {fy["two_years_ago_fy"]}, {fy["previous_fy"]}, {fy["current_fy"]} (YTD)
 
 Default Time Period Rules:
-- If the user does NOT specify any time period, default to the PREVIOUS complete FY
-  ({fy["previous_fy"]}: {fy["prev_fy_start"]} to {fy["prev_fy_end"]}).
-  Current year data is incomplete; previous year gives a full picture.
-- If the user says "YTD" or "current year", filter from {fy["cur_fy_start"]} to {fy["today"]}.
-- If the user specifies a FY (e.g. FY26), use that year's full date range.
-- If the user specifies a quarter (e.g. Q2 FY26), use the corresponding date range above.
-- If the user specifies a custom date range, use it directly.
+- If the user does NOT specify any time period, default to CURRENT FY YTD:
+  transaction_fy_quarter LIKE '{fy["current_fy"]}%'
+- "current year" / "this year" / "YTD"     → transaction_fy_quarter LIKE '{fy["current_fy"]}%'
+- "last year" / "previous year" / "FY26"   → transaction_fy_quarter LIKE '{fy["previous_fy"]}%'
+- "FY25" / "two years ago"                 → transaction_fy_quarter LIKE '{fy["two_years_ago_fy"]}%'
+- "this quarter" / "current quarter"       → transaction_fy_quarter = '{fy["current_quarter"]}'
+- "last quarter" / "previous quarter"      → transaction_fy_quarter = '{fy["last_quarter"]}'
+- "last 2 years"                           → transaction_fy_quarter LIKE '{fy["previous_fy"]}%' OR transaction_fy_quarter LIKE '{fy["current_fy"]}%'
+- "all time" / "all years" / QoQ/YoY      → no time filter
+- Custom date range                        → use transaction_date
 
-Date Column Rules:
-- For BILLING   : always use billing_date for date filtering (not fy_quarter).
-- For COLLECTIONS: always use payment_date for date filtering (not fy_quarter).
-- Use fy_quarter column ONLY for GROUP BY / display, never for WHERE filtering.
-- For grouping by quarter in display, fy_quarter column can be used as-is.
+Year and Quarter as Dimensions:
+- "by year" / "year-wise" / "annual"  → GROUP BY LEFT(transaction_fy_quarter, 4) AS fy_year
+- "by quarter" / "QoQ" / "quarterly"  → GROUP BY transaction_fy_quarter
+- fy_year sort: FY25 → FY26 → FY27 (chronological ASC)
 
-{quarter_ranges}
+transaction_fy_quarter Column:
+- Pre-computed in views. Format: 'FY26 Q1', 'FY27 Q2', etc.
+- Use for both WHERE filtering and GROUP BY.
+"""
+
+    if domain == "ar":
+        return f"""
+You are a finance analytics assistant specializing in Accounts Receivable (AR).
+
+Use the following table/view context:
+
+{AR_CONTEXT}
+
+{PRESENTATION_RULES}
+
+{STRICT_METRIC_SELECTION_RULES}
+
+{AR_SEMANTIC_MODEL}
+
+Core Rules:
+- Generate PostgreSQL queries only.
+- Only SELECT statements are allowed.
+- Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, or CREATE.
+- Use only the tables and columns provided in the context.
+- SQL should be production-safe and readable.
+- Do not use markdown.
+- Do not generate text JSON.
+- Always use the provided tool to return structured output.
+
+AR-Specific Rules:
+- AR is a real-time snapshot as of today. Do NOT add time-period WHERE filters.
+- transaction_fy_quarter is a GROUP BY dimension only (invoice creation quarter) — not for WHERE.
+- No tds_flag in AR.
+- Always filter inter_company_status = 'F' unless user asks for intercompany.
+- open_amount is signed (positive=invoice, negative=credit/payment). SUM gives net AR.
+- open_amount is in transaction currency — always convert using exchange rate columns.
+- Default currency is USD. Use INR only if user asks.
+- Ageing buckets are derived via CASE WHEN on open_days — never filter a pre-computed column.
+- Never SELECT customer_id, transaction_id, subsidiary_id unless explicitly requested.
+- All columns use new unified names: region, client_journey_stage, subsidiary_name,
+    currency_symbol, transaction_date, duedate, transaction_fy_quarter.
+
+Display Rules:
+- Always include display metadata.
+- display.title should be user-friendly.
+- display.currency should match the selected reporting currency.
+- display.columns should map SQL aliases to clean column names (no currency suffix).
+- display.formatting should define currency formatting for all amount columns.
 """
 
     if domain == "collections":
@@ -264,15 +339,26 @@ Core Rules:
 
 Default Filters:
 - Always apply inter_company_status = 'F' unless user asks for intercompany.
-- TDS is included by default. Only add tds_flag = 'F' when user asks for
-  "net collections", "excluding TDS", or "collections excluding tax".
+- Always apply tds_flag = 'F' by default (net collections — TDS excluded).
+  Only remove when user says "including TDS" or "gross collections".
 
 Currency Rules:
 - Default reporting currency is INR unless user asks for USD.
-- collection_amt is in transaction currency.
-- Convert to INR using: collection_amt * inr_exchangerate
-- Convert to USD using: collection_amt * usd_exchangerate
-- Never use pre-computed collection_amt_usd or collection_amt_inr columns.
+- Use collection_amount (NOT transaction_amount) for all collection metrics.
+- collection_amount is in transaction currency.
+- Convert to INR using: collection_amount * inr_exchangerate
+- Convert to USD using: collection_amount * usd_exchangerate
+- Never use pre-computed currency columns; always compute inside SQL.
+
+Key column names (updated schema):
+- transaction_date: date of payment
+- collection_amount: per-invoice collection amount (use this, not transaction_amount)
+- collection_due_date: due date of linked invoice
+- transaction_fy_quarter: FY quarter of payment
+- region: customer region
+- subsidiary_name: billing entity name
+- paying_entity: paying entity (intercompany only)
+- currency_symbol: transaction currency symbol
 
 Ageing Bucket Rules:
 - Valid buckets in order: 'Within CP', '1-15 days', '16-30 days', '31-45 days',
@@ -315,10 +401,11 @@ Core Rules:
 - Always use the provided tool to return structured output.
 
 Currency Rules:
-- For billing, default currency is USD unless the user explicitly asks for INR.
-- Billing amount/fee/tax columns are in transaction currency.
+- Default currency is USD unless user asks for INR.
+- billing_amount (= transaction_amount) and all fee columns are in transaction currency.
 - Convert using usd_exchangerate or inr_exchangerate inside SQL.
-- Do not use billed_amt_usd, billed_amt_inr, billed_tax_amt_usd, or billed_tax_amt_inr.
+- Tax: use COALESCE(transaction_tax,0) * rate. Never pre-computed tax columns.
+- Excluding tax: billing_amount - COALESCE(transaction_tax,0), then multiply by rate.
 
 Display Rules:
 - Always include display metadata.
@@ -341,7 +428,7 @@ def validate_sql(sql: str, metadata: dict = None) -> str:
         "alter", "truncate", "create"
     ]
 
-    if not cleaned.startswith("select"):
+    if not cleaned.startswith("select") and not cleaned.startswith("with"):
         raise HTTPException(status_code=400, detail="Only SELECT queries are allowed.")
 
     if any(word in cleaned for word in blocked_words):
@@ -386,7 +473,7 @@ def chat(request: ChatRequest):
     if not engine:
         raise HTTPException(status_code=500, detail="DATABASE_URL is not loaded")
 
-    domain = classify_domain(request.message)
+    domain = classify_domain(request.message, request.history)
     system_prompt = build_system_prompt(domain)
 
     import time
@@ -395,15 +482,21 @@ def chat(request: ChatRequest):
         print(f"\n[{domain.upper()}] Query: {request.message}")
 
         t0 = time.time()
-        print(f"  → Calling Claude...")
+        print(f"  → Calling Claude... (history turns: {len(request.history)})")
+
+        # Build messages — inject conversation history before current message
+        messages = []
+        for turn in request.history:
+            messages.append({"role": "user",      "content": turn["user"]})
+            messages.append({"role": "assistant",  "content": turn["assistant"]})
+        messages.append({"role": "user", "content": request.message})
+
         claude_response = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=4096,
             temperature=0,
             system=system_prompt,
-            messages=[
-                {"role": "user", "content": request.message}
-            ],
+            messages=messages,
             tools=TOOLS,
             tool_choice={
                 "type": "tool",
@@ -436,18 +529,32 @@ def chat(request: ChatRequest):
         print(f"  ✓ DB returned {len(df)} rows in {t3 - t2:.1f}s")
         print(f"  ✓ Total: {t3 - t0:.1f}s")
 
-        # Replace NaN/Inf with None so JSON serialization never fails
-        df = df.where(pd.notnull(df), None)
+        # Replace NaN/Inf/None in ALL column types before JSON serialization
+        # astype(object) ensures string columns also get NaN replaced properly
+        df = df.astype(object).where(pd.notnull(df), other=None)
+
+        usage = {
+            "input_tokens":  claude_response.usage.input_tokens,
+            "output_tokens": claude_response.usage.output_tokens,
+        }
+
+        # Build a plain-text assistant summary for conversation history storage
+        display  = parsed.get("display", {})
+        assistant_summary = (
+            f"Report generated: {display.get('title', 'Untitled')}\n"
+            f"{parsed.get('explanation', '')}\n"
+            f"Visualization: {parsed.get('visualization', 'table')}"
+            f"{' (' + parsed.get('pivot_type','') + ')' if parsed.get('pivot_type') else ''}\n"
+            f"SQL used:\n{parsed.get('sql', '')}"
+        )
 
         return {
-            "metadata": parsed,
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns),
-            "domain": domain,
-            "usage": {
-                "input_tokens": claude_response.usage.input_tokens,
-                "output_tokens": claude_response.usage.output_tokens
-            }
+            "metadata":          parsed,
+            "data":              df.to_dict(orient="records"),
+            "columns":           list(df.columns),
+            "domain":            domain,
+            "assistant_summary": assistant_summary,
+            "usage":             usage,
         }
 
     except Exception as e:
