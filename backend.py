@@ -174,7 +174,11 @@ COLLECTION_KEYWORDS = [
 ]
 
 BILLING_KEYWORDS = [
-    # Specific billing terms — NOT "billing" alone (ambiguous with "billing entity")
+    # "billing" alone is a strong billing signal AFTER neutral phrase stripping.
+    # "billing entity" / "billing subsidiary" are stripped before scoring so
+    # "collections for billing entity us" correctly scores zero here.
+    "billing", "bill",
+    "invoice", "invoices", "invoiced",
     "billed", "billed revenue", "billed amount",
     "invoice type", "invoice split", "revenue split",
     "subscription revenue", "implementation revenue",
@@ -184,7 +188,7 @@ BILLING_KEYWORDS = [
     "credit note",
 ]
 
-# Terms that appear in ALL domains — never use for routing
+# Terms that appear in ALL domains — strip before scoring so they don't skew routing
 NEUTRAL_PHRASES = [
     "billing entity", "billing subsidiary",
     "subsidiary", "paying entity", "billed entity",
@@ -194,14 +198,13 @@ NEUTRAL_PHRASES = [
 def classify_domain(message: str, history: list = []) -> str:
     """
     Returns 'ar', 'collections', or 'billing' based on keyword scoring.
-    AR is checked first as it has the most distinct keywords.
-    Neutral phrases (billing entity, subsidiary) are excluded from scoring.
-    Falls back to the last domain from conversation history when score is ambiguous.
-    Defaults to 'billing' if no keywords match and no history exists.
+    Neutral phrases are stripped first so "billing entity" doesn't score as billing.
+    Falls back to last domain in history ONLY when score is truly zero across all domains.
+    Defaults to 'billing' when no signal exists anywhere.
     """
     msg = message.lower()
 
-    # Strip neutral phrases so they don't skew domain detection
+    # Strip neutral phrases before scoring
     for phrase in NEUTRAL_PHRASES:
         msg = msg.replace(phrase, "")
 
@@ -209,25 +212,20 @@ def classify_domain(message: str, history: list = []) -> str:
     collection_score = sum(1 for kw in COLLECTION_KEYWORDS if kw in msg)
     billing_score    = sum(1 for kw in BILLING_KEYWORDS if kw in msg)
 
-    # Strong AR signal
-    if ar_score > 0 and ar_score >= collection_score and ar_score >= billing_score:
-        return "ar"
-
-    # Strong collections signal
-    if collection_score > billing_score and collection_score > ar_score:
-        return "collections"
-
-    # Strong billing signal
-    if billing_score > 0:
+    # If any domain has a signal, pick the winner — don't fall back to history
+    if ar_score > 0 or collection_score > 0 or billing_score > 0:
+        if ar_score >= collection_score and ar_score >= billing_score:
+            return "ar"
+        if collection_score >= billing_score:
+            return "collections"
         return "billing"
 
-    # No strong signal — fall back to last domain from conversation history
+    # Truly no signal — fall back to last domain from conversation history
     if history:
         for turn in reversed(history):
             if turn.get("domain"):
                 return turn["domain"]
 
-    # Default
     return "billing"
 
 

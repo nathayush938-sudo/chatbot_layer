@@ -30,6 +30,12 @@ with st.sidebar:
     else:
         st.caption("Showing abbreviated formatted values")
 
+    st.divider()
+    if st.button("🗑️ Clear conversation", use_container_width=True):
+        st.session_state.exchanges    = []
+        st.session_state.chat_history = []
+        st.rerun()
+
 BACKEND_URL = "http://127.0.0.1:8000/chat"
 
 
@@ -113,25 +119,27 @@ def is_metric_column(col):
 def reorder_columns(df):
     cols = df.columns.tolist()
 
-    row_pct_cols = [c for c in cols if c == "Row %"]
+    # "Row %" is a single-metric companion — handled separately at the end.
+    # Named pct cols (e.g. "Outstanding %", "Overdue %") must be interleaved
+    # immediately after their matching metric column.
+    row_pct_cols   = [c for c in cols if c == "Row %"]
+    named_pct_cols = [c for c in cols if c.endswith(" %") and c != "Row %"]
+    all_pct_cols   = set(row_pct_cols + named_pct_cols)
 
     id_cols = [
         c for c in cols
         if "id" in c.lower()
-        and c not in row_pct_cols
+        and c not in all_pct_cols
     ]
 
     name_cols = [
         c for c in cols
         if "name" in c.lower()
         and c not in id_cols
-        and c not in row_pct_cols
+        and c not in all_pct_cols
     ]
 
-    total_cols = [
-        c for c in cols
-        if c == "Total"
-    ]
+    total_cols = [c for c in cols if c == "Total"]
 
     metric_cols = [
         c for c in cols
@@ -139,23 +147,39 @@ def reorder_columns(df):
         and c not in id_cols
         and c not in name_cols
         and c not in total_cols
-        and c not in row_pct_cols
+        and c not in all_pct_cols
     ]
 
-    used = id_cols + name_cols + metric_cols + total_cols + row_pct_cols
+    # Interleave each metric with its named pct partner (if one exists).
+    # Match rule: the keyword in "X %" (e.g. "outstanding" from "Outstanding %")
+    # must appear somewhere in the metric column name (e.g. "Amount Outstanding").
+    interleaved_metrics = []
+    used_pct = set()
+    for metric in metric_cols:
+        interleaved_metrics.append(metric)
+        for pct in named_pct_cols:
+            if pct in used_pct:
+                continue
+            keyword = pct.replace(" %", "").strip().lower()
+            if keyword in metric.lower():
+                interleaved_metrics.append(pct)
+                used_pct.add(pct)
+                break
 
-    other_cols = [
-        c for c in cols
-        if c not in used
-    ]
+    # Any unmatched named pct cols go after all metrics
+    for pct in named_pct_cols:
+        if pct not in used_pct:
+            interleaved_metrics.append(pct)
 
-    # Place Row % immediately after metric cols so it reads as
-    # "amount | percentage" rather than being stranded at the far right.
+    used = set(id_cols + name_cols + interleaved_metrics + total_cols + row_pct_cols)
+    other_cols = [c for c in cols if c not in used]
+
+    # Final order: dims | other | metric+pct pairs | Row % | Total
     ordered_cols = (
         id_cols
         + name_cols
         + other_cols
-        + metric_cols
+        + interleaved_metrics
         + row_pct_cols
         + total_cols
     )
@@ -297,9 +321,13 @@ def apply_display_formatting(df, metadata):
                       if "pct_of" in c.lower() or "as % of" in c.lower()]
 
         if len(df) > 1:
+            # Named pct cols (e.g. "Outstanding %", "Overdue %") represent each
+            # row's share of the total — grand total is always 100% (= 1.0).
+            named_pct_set = {c for c in df.columns if c.endswith(" %") and c != "Row %"}
+
             grand_row = {}
             for col in df.columns:
-                if col == "Row %":
+                if col == "Row %" or col in named_pct_set:
                     grand_row[col] = 1.0
                 elif is_id_column(col) or col in ratio_cols:
                     grand_row[col] = ""   # never sum IDs or ratios
@@ -628,7 +656,7 @@ def apply_ageing_pivot_formatting(pivot_df, metadata, row_cols):
 user_input = st.chat_input("Ask something")
 
 def render_exchange(exchange):
-    """Re-render a stored exchange (user + assistant response)."""
+    """Re-render a stored exchange (user + assistant response). Pure display — no state mutation."""
     with st.chat_message("user"):
         st.write(exchange["user_input"])
 
@@ -657,20 +685,6 @@ def render_exchange(exchange):
 
         with st.expander("Token usage"):
             st.json(result.get("usage", {}))
-
-    # ── Store exchange in session state ─────────────────────────────────────
-    st.session_state.exchanges.append({
-        "user_input": user_input,
-        "result":     result,
-        "error":      None,
-    })
-
-    # Full session history — all turns kept, including domain for context-aware routing
-    st.session_state.chat_history.append({
-        "user":      user_input,
-        "assistant": result.get("assistant_summary", ""),
-        "domain":    result.get("domain", "billing"),
-    })
 
 
 def render_result(df, metadata, result):
@@ -757,13 +771,13 @@ def render_result(df, metadata, result):
             st.write(list(df.columns))
 
 
-# ── Replay previous exchanges ─────────────────────────────────────────────────
+# ── Conversation: replay all previous exchanges, then handle new input ─────────
+
 for exchange in st.session_state.exchanges:
     render_exchange(exchange)
 
-
-# ── New input ─────────────────────────────────────────────────────────────────
 if user_input:
+    # Show the user bubble immediately
     with st.chat_message("user"):
         st.write(user_input)
 
@@ -775,7 +789,7 @@ if user_input:
                 "message": user_input,
                 "history": st.session_state.chat_history,
             },
-            timeout=300
+            timeout=300,
         )
     except requests.exceptions.ReadTimeout:
         st.error("Request timed out after 300 s. The query or Claude response took too long.")
@@ -784,6 +798,7 @@ if user_input:
         st.error("Could not connect to backend at " + BACKEND_URL + ". Is the FastAPI server running?")
         st.stop()
 
+    # ── Error handling ──────────────────────────────────────────────────────
     if response.status_code != 200:
         try:
             detail = response.json().get("detail", response.text)
@@ -792,10 +807,9 @@ if user_input:
 
         with st.chat_message("assistant"):
             if response.status_code == 400 and "GROUP BY" in detail:
-                # Invalid dimension — extract the bad dimension name cleanly
                 import re
                 dim_match = re.search(r"dimensions [(](.+?)[)]", detail)
-                bad_dims   = dim_match.group(1).replace("'", "").strip() if dim_match else "unknown"
+                bad_dims  = dim_match.group(1).replace("'", "").strip() if dim_match else "unknown"
                 st.warning(
                     f"I couldn't find **{bad_dims}** as a valid grouping dimension. "
                     f"Try rephrasing using one of: **region, customer, quarter, "
@@ -805,103 +819,46 @@ if user_input:
                 st.error("Something went wrong. Please try rephrasing your question.")
                 with st.expander("Details"):
                     st.code(detail)
+
+        # Save the error exchange so it appears in conversation history on rerun
+        st.session_state.exchanges.append({
+            "user_input": user_input,
+            "result":     None,
+            "error":      detail,
+        })
         st.stop()
 
+    # ── Successful response ─────────────────────────────────────────────────
     result   = response.json()
     metadata = result["metadata"]
     data     = result["data"]
     df       = pd.DataFrame(data)
 
-    # ── Render ──────────────────────────────────────────────────────────────
     with st.chat_message("assistant"):
         display     = metadata.get("display", {})
         title       = display.get("title")
         explanation = metadata.get("explanation", "")
 
-        if title:
-            st.subheader(title)
-        if explanation:
-            st.write(explanation)
+        if title:       st.subheader(title)
+        if explanation: st.write(explanation)
 
         with st.expander("Generated SQL"):
             st.code(metadata.get("sql", ""), language="sql")
 
-        visualization = metadata.get("visualization")
-
-        try:
-            if visualization == "pivot_table" and metadata.get("pivot_type") == "metric":
-                df = apply_metric_pivot_formatting(df, metadata)
-                st.dataframe(df, width='stretch', hide_index=True)
-
-            elif visualization == "pivot_table" and metadata.get("pivot_type") == "dimension":
-                rows        = metadata["rows"]
-                columns     = metadata["columns"]
-                values      = metadata["values"][0]
-                aggregation = metadata.get("aggregation", "sum")
-
-                pivot_df = df.pivot_table(
-                    index=rows,
-                    columns=columns,
-                    values=values,
-                    aggfunc=aggregation,
-                    fill_value=0
-                ).reset_index()
-
-                pivot_df.columns  = [str(col) for col in pivot_df.columns]
-                column_map        = {k: strip_currency_suffix(v) for k, v in display.get("columns", {}).items()}
-                pivot_df          = pivot_df.rename(columns=column_map)
-                renamed_rows      = [column_map.get(row, row) for row in rows]
-
-                # Combine row + column dimension names in the top-left header
-                # e.g. "Receiving Entity ↓  |  Paying Entity →"
-                row_label    = column_map.get(rows[0], rows[0]) if rows else ""
-                col_label    = column_map.get(columns[0], columns[0]) if columns else ""
-                if row_label and col_label:
-                    combined_header = f"{row_label} ↓  |  {col_label} →"
-                    pivot_df        = pivot_df.rename(columns={row_label: combined_header})
-                    renamed_rows    = [combined_header if r == row_label else r for r in renamed_rows]
-                pivot_df          = add_pivot_totals_and_sort(pivot_df, renamed_rows)
-                pivot_df          = format_pivot_values(pivot_df, metadata, renamed_rows)
-
-                st.dataframe(pivot_df, width='stretch', hide_index=True)
-
-            else:
-                # Detect detail query: no GROUP BY in SQL → use detail formatter
-                sql_lower = metadata.get("sql", "").lower()
-                is_detail = "group by" not in sql_lower
-
-                if is_detail and len(df) > 1:
-                    df = apply_detail_formatting(df, metadata)
-                    st.dataframe(df, width='stretch', hide_index=True)
-                # Single-row result → show as KPI cards instead of a table
-                elif len(df) == 1:
-                    display_meta = metadata.get("display", {})
-                    currency     = display_meta.get("currency", "USD")
-                    col_map      = {k: strip_currency_suffix(v)
-                                    for k, v in display_meta.get("columns", {}).items()}
-                    numeric_cols = df.select_dtypes(include="number").columns.tolist()
-                    metric_cols  = [c for c in numeric_cols if is_metric_column(c)]
-
-                    if metric_cols:
-                        kpi_cols = st.columns(len(metric_cols))
-                        for i, col in enumerate(metric_cols):
-                            label = col_map.get(col, col)
-                            label = strip_currency_suffix(label)
-                            value = format_currency_value(float(df[col].iloc[0]), currency)
-                            kpi_cols[i].metric(label=label, value=value)
-                    else:
-                        df = apply_display_formatting(df, metadata)
-                        st.dataframe(df, width='stretch', hide_index=True)
-                else:
-                    df = apply_display_formatting(df, metadata)
-                    st.dataframe(df, width='stretch', hide_index=True)
-
-        except Exception as render_err:
-            st.error(f"Rendering error: {render_err}")
-            with st.expander("Debug — raw metadata from Claude"):
-                st.json(metadata)
-            with st.expander("Debug — raw data columns"):
-                st.write(list(df.columns))
+        render_result(df, metadata, result)
 
         with st.expander("Token usage"):
             st.json(result.get("usage", {}))
+
+    # ── Save to session state (must happen AFTER rendering) ─────────────────
+    st.session_state.exchanges.append({
+        "user_input": user_input,
+        "result":     result,
+        "error":      None,
+    })
+
+    st.session_state.chat_history.append({
+        "user":      user_input,
+        "assistant": result.get("assistant_summary", ""),
+        "domain":    result.get("domain", "billing"),
+    })
