@@ -2,6 +2,12 @@ import streamlit as st
 import requests
 import pandas as pd
 
+try:
+    import plotly.express as px
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+
 st.set_page_config(
     page_title="Finance AI Chatbot",
     layout="wide"
@@ -20,15 +26,16 @@ if "raw_values" not in st.session_state:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Display Settings")
+
     st.session_state.raw_values = st.toggle(
         "Show raw values",
         value=st.session_state.raw_values,
-        help="Switch between formatted (₹11.85 Cr / $75.83 Mn) and full unformatted numbers"
+        help="USD: $1.23 Mn / $1.23 K  |  INR: ₹1.23 Cr / ₹1.23 L / ₹1.23 K"
     )
     if st.session_state.raw_values:
         st.caption("Showing full unformatted numbers")
     else:
-        st.caption("Showing abbreviated formatted values")
+        st.caption("USD: Bn / Mn / K  |  INR: Cr / L / K")
 
     st.divider()
     if st.button("🗑️ Clear conversation", use_container_width=True):
@@ -52,22 +59,49 @@ def get_currency_symbol(currency):
 
 def format_currency_value(x, currency, decimals=2):
     """
-    Formats a numeric value.
-    Formatted mode (default): ₹1.23 Cr / $1.23 Mn
-    Raw mode (toggle on):     1,23,00,000 (full number, no symbol, commas only)
-    Returns empty string for null/non-numeric values.
+    Formats a numeric value with dynamic denomination based on magnitude.
+
+    Raw mode (toggle on):  full number with thousand separators, no symbol.
+
+    Formatted mode (default):
+      USD / other : Bn → Mn → K → raw
+        >= 1,000,000,000  →  $1.23 Bn
+        >= 1,000,000      →  $1.23 Mn
+        >= 1,000          →  $1.23 K
+        < 1,000           →  $123
+
+      INR : Cr → L → K → raw  (standard Indian financial notation)
+        >= 10,000,000     →  ₹1.23 Cr   (crore)
+        >= 100,000        →  ₹1.23 L    (lakh)
+        >= 1,000          →  ₹1.23 K
+        < 1,000           →  ₹123
     """
     if not isinstance(x, (int, float)) or not pd.notnull(x):
         return ""
-    # Raw mode — full unformatted number with thousand separators
+
     if st.session_state.get("raw_values", False):
         return f"{x:,.0f}"
+
     symbol   = get_currency_symbol(currency)
     currency = (currency or "").upper()
+    abs_x    = abs(x)
+
     if currency == "INR":
-        return f"{symbol}{x / 10_000_000:,.{decimals}f} Cr"
+        if abs_x >= 10_000_000:
+            return f"{symbol}{x / 10_000_000:,.{decimals}f} Cr"
+        if abs_x >= 100_000:
+            return f"{symbol}{x / 100_000:,.{decimals}f} L"
+        if abs_x >= 1_000:
+            return f"{symbol}{x / 1_000:,.{decimals}f} K"
+        return f"{symbol}{x:,.0f}"
     else:
-        return f"{symbol}{x / 1_000_000:,.{decimals}f} Mn"
+        if abs_x >= 1_000_000_000:
+            return f"{symbol}{x / 1_000_000_000:,.{decimals}f} Bn"
+        if abs_x >= 1_000_000:
+            return f"{symbol}{x / 1_000_000:,.{decimals}f} Mn"
+        if abs_x >= 1_000:
+            return f"{symbol}{x / 1_000:,.{decimals}f} K"
+        return f"{symbol}{x:,.0f}"
 
 
 QUARTER_SORT_KEYWORDS = ["quarter", "fy", "month", "year", "date", "period", "annual"]
@@ -655,7 +689,7 @@ def apply_ageing_pivot_formatting(pivot_df, metadata, row_cols):
 
 user_input = st.chat_input("Ask something")
 
-def render_exchange(exchange):
+def render_exchange(exchange, idx: int = 0):
     """Re-render a stored exchange (user + assistant response). Pure display — no state mutation."""
     with st.chat_message("user"):
         st.write(exchange["user_input"])
@@ -681,20 +715,252 @@ def render_exchange(exchange):
         with st.expander("Generated SQL"):
             st.code(metadata.get("sql", ""), language="sql")
 
-        render_result(df, metadata, result)
+        render_result(df, metadata, result, view_key=f"exchange_{idx}")
 
         with st.expander("Token usage"):
             st.json(result.get("usage", {}))
 
 
-def render_result(df, metadata, result):
+def render_chart(df, metadata, view_key: str = "default"):
+    """
+    Render a Plotly chart from the raw (unformatted) DataFrame.
+    Falls back to the table view if plotly is not installed.
+    Respects st.session_state.raw_values for number formatting.
+    """
+    if not PLOTLY_AVAILABLE:
+        st.warning("Plotly is not installed. Run `pip install plotly` to enable charts.")
+        render_result(df, metadata, {}, view_key=view_key)
+        return
+
+    viz          = metadata.get("visualization", "table")
+    pivot_type   = metadata.get("pivot_type", "metric")
+    display      = metadata.get("display", {})
+    currency     = display.get("currency", "USD")
+    symbol       = get_currency_symbol(currency)
+    title        = display.get("title", "")
+    col_map      = {k: strip_currency_suffix(v)
+                    for k, v in display.get("columns", {}).items()}
+
+    df_chart     = df.rename(columns=col_map)
+    numeric_cols = df_chart.select_dtypes(include="number").columns.tolist()
+    string_cols  = df_chart.select_dtypes(include="object").columns.tolist()
+
+    raw_values    = st.session_state.get("raw_values", False)
+    PLOTLY_COLORS = px.colors.qualitative.Set2
+    tick_fmt      = ",.0f" if raw_values else ".2s"
+    label_fmt     = ",.0f" if raw_values else ".2s"
+
+    # ── LINE CHART ────────────────────────────────────────────────────────────
+    if viz == "line_chart":
+        dim_col = string_cols[0] if string_cols else None
+        if not dim_col or not numeric_cols:
+            st.info("Not enough data to draw a chart.")
+            return
+        fig = px.line(
+            df_chart, x=dim_col, y=numeric_cols,
+            title=title, markers=True, color_discrete_sequence=PLOTLY_COLORS,
+            height=400,
+        )
+        fig.update_layout(
+            xaxis_title="", yaxis_title=f"Amount ({symbol})",
+            legend_title="Metric", hovermode="x unified",
+            yaxis=dict(tickformat=tick_fmt),
+        )
+        fig.update_traces(hovertemplate=f"%{{y:{tick_fmt}}}")
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+
+    # ── BAR CHART ─────────────────────────────────────────────────────────────
+    elif viz == "bar_chart":
+        dim_col     = string_cols[0] if string_cols else None
+        metric_list = [c for c in numeric_cols if c in df_chart.columns]
+        if not dim_col or not metric_list:
+            st.info("Not enough data to draw a chart.")
+            return
+
+        is_horizontal = any(kw in dim_col.lower()
+                            for kw in ["customer", "account", "name"])
+
+        if is_horizontal:
+            # Top-N selector — only show when there are more rows than the minimum
+            n_options  = [n for n in [10, 20, 50] if n < len(df_chart)] + ["All"]
+            if len(n_options) > 1:
+                sel = st.radio(
+                    "Show top",
+                    options=n_options,
+                    index=0,
+                    horizontal=True,
+                    key=f"topn_{view_key}",
+                )
+                n_rows = len(df_chart) if sel == "All" else int(sel)
+            else:
+                n_rows = len(df_chart)
+
+            plot_df = df_chart[[dim_col] + metric_list] \
+                          .sort_values(metric_list[0], ascending=False) \
+                          .head(n_rows) \
+                          .sort_values(metric_list[0], ascending=True)  # flip for horizontal display
+
+            chart_height = max(350, n_rows * 35 + 80)
+
+            fig = px.bar(
+                plot_df, x=metric_list[0], y=dim_col, orientation="h",
+                title=title, color_discrete_sequence=PLOTLY_COLORS,
+                text=plot_df[metric_list[0]].apply(lambda v: format_currency_value(v, currency)),
+                height=chart_height,
+            )
+            fig.update_layout(
+                xaxis=dict(title=f"Amount ({symbol})", tickformat=tick_fmt),
+                yaxis_title="",
+                margin=dict(l=10, r=10, t=40, b=10),
+            )
+            fig.update_traces(textposition="outside", cliponaxis=False)
+        else:
+            n_rows = len(df_chart)
+            chart_height = max(350, min(600, n_rows * 45 + 80))
+            if len(metric_list) > 1:
+                fig = px.bar(
+                    df_chart, x=dim_col, y=metric_list, barmode="group",
+                    title=title, color_discrete_sequence=PLOTLY_COLORS,
+                    height=chart_height,
+                )
+            else:
+                fig = px.bar(
+                    df_chart, x=dim_col, y=metric_list[0],
+                    title=title, color_discrete_sequence=PLOTLY_COLORS,
+                    text=df_chart[metric_list[0]].apply(lambda v: format_currency_value(v, currency)),
+                    height=chart_height,
+                )
+            fig.update_layout(
+                xaxis_title="",
+                yaxis=dict(title=f"Amount ({symbol})", tickformat=tick_fmt),
+                legend_title="Metric",
+                margin=dict(l=10, r=10, t=40, b=10),
+            )
+        st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+
+    # ── PIVOT TABLE ───────────────────────────────────────────────────────────
+    elif viz == "pivot_table":
+
+        if pivot_type == "metric":
+            rows_meta       = metadata.get("rows", [])
+            metric_cols_raw = metadata.get("metric_columns", [])
+            renamed_rows    = [col_map.get(r, r) for r in rows_meta]
+            renamed_metrics = [strip_currency_suffix(col_map.get(m, m))
+                               for m in metric_cols_raw]
+            existing        = [c for c in renamed_metrics if c in df_chart.columns]
+
+            # No dimension → horizontal bar (e.g. invoice type split overall)
+            if not renamed_rows or all(r not in df_chart.columns for r in renamed_rows):
+                totals   = {m: float(df_chart[m].sum()) for m in existing}
+                chart_df = pd.DataFrame({
+                    "Type":   list(totals.keys()),
+                    "Amount": list(totals.values()),
+                }).sort_values("Amount", ascending=True)
+                fig = px.bar(
+                    chart_df, x="Amount", y="Type", orientation="h",
+                    title=title, color_discrete_sequence=PLOTLY_COLORS,
+                    text=chart_df["Amount"].apply(lambda v: format_currency_value(v, currency)),
+                )
+                fig.update_layout(
+                    xaxis=dict(title=f"Amount ({symbol})", tickformat=tick_fmt),
+                    yaxis_title="",
+                )
+
+            # With dimension → stacked bar (e.g. QoQ × fee type split)
+            else:
+                dim = next((r for r in renamed_rows if r in df_chart.columns), None)
+                if not dim:
+                    st.info("Chart not available for this result.")
+                    return
+                fig = px.bar(
+                    df_chart, x=dim, y=existing,
+                    barmode="stack",          # stacked — shows composition per period
+                    title=title, color_discrete_sequence=PLOTLY_COLORS,
+                )
+                fig.update_layout(
+                    xaxis_title="",
+                    yaxis=dict(title=f"Amount ({symbol})", tickformat=tick_fmt),
+                    legend_title="Revenue Type",
+                )
+
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+
+        elif pivot_type == "dimension":
+            rows_meta   = metadata.get("rows", [])
+            cols_meta   = metadata.get("columns", [])
+            values_meta = (metadata.get("values") or [None])[0]
+            if not (rows_meta and cols_meta and values_meta):
+                st.info("Chart not available for this pivot.")
+                return
+            r = col_map.get(rows_meta[0],  rows_meta[0])
+            c = col_map.get(cols_meta[0],  cols_meta[0])
+            v = col_map.get(values_meta,    values_meta)
+            if not all(x in df_chart.columns for x in [r, c, v]):
+                st.info("Chart not available for this pivot.")
+                return
+            pivot_2d = df_chart.pivot_table(
+                index=r, columns=c, values=v, aggfunc="sum", fill_value=0)
+
+            # Heatmap text is always abbreviated — raw numbers overlap and defeat
+            # the purpose of the visual. Raw values toggle applies to tables only.
+            def abbrev(val):
+                if abs(val) >= 1_000_000: return f"{val/1_000_000:.1f}M"
+                if abs(val) >= 1_000:     return f"{val/1_000:.1f}K"
+                return f"{val:,.0f}"
+
+            text_matrix = [[abbrev(v) for v in row] for row in pivot_2d.values]
+
+            fig = px.imshow(
+                pivot_2d, title=title, aspect="auto",
+                color_continuous_scale="Blues",
+                text_auto=False,
+            )
+            for i, row in enumerate(text_matrix):
+                for j, txt in enumerate(row):
+                    fig.add_annotation(
+                        x=j, y=i, text=txt,
+                        showarrow=False, font=dict(size=11),
+                        xref="x", yref="y",
+                    )
+            fig.update_layout(xaxis_title=c, yaxis_title=r)
+            st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+
+    else:
+        st.info("Chart not available for this result type.")
+
+
+def render_result(df, metadata, result, view_key: str = "default"):
     """Core rendering logic — shared between live and replay."""
     display       = metadata.get("display", {})
     visualization = metadata.get("visualization")
 
     if metadata.get("metric_columns"):
-        visualization           = "pivot_table"
-        metadata["pivot_type"]  = "metric"
+        visualization          = "pivot_table"
+        metadata["pivot_type"] = "metric"
+
+    sql_lower = metadata.get("sql", "").lower()
+    is_detail = "group by" not in sql_lower
+    chartable = visualization in ("bar_chart", "line_chart", "pivot_table") and not is_detail
+
+    if chartable:
+        toggle_key = f"view_mode_{view_key}"
+        if toggle_key not in st.session_state:
+            st.session_state[toggle_key] = "Table"
+        col_toggle, _ = st.columns([2, 8])
+        with col_toggle:
+            view_mode = st.radio(
+                "View",
+                options=["Table", "Chart"],
+                horizontal=True,
+                label_visibility="collapsed",
+                key=toggle_key,
+            )
+    else:
+        view_mode = "Table"
+
+    if chartable and view_mode == "Chart":
+        render_chart(df, metadata, view_key=view_key)
+        return
 
     try:
         if visualization == "pivot_table" and metadata.get("pivot_type") == "metric":
@@ -773,8 +1039,8 @@ def render_result(df, metadata, result):
 
 # ── Conversation: replay all previous exchanges, then handle new input ─────────
 
-for exchange in st.session_state.exchanges:
-    render_exchange(exchange)
+for idx, exchange in enumerate(st.session_state.exchanges):
+    render_exchange(exchange, idx=idx)
 
 if user_input:
     # Show the user bubble immediately
@@ -845,7 +1111,7 @@ if user_input:
         with st.expander("Generated SQL"):
             st.code(metadata.get("sql", ""), language="sql")
 
-        render_result(df, metadata, result)
+        render_result(df, metadata, result, view_key=f"exchange_{len(st.session_state.exchanges)}")
 
         with st.expander("Token usage"):
             st.json(result.get("usage", {}))
