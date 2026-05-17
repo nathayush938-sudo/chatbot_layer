@@ -15,6 +15,7 @@ from schema_context import (
     AR_CONTEXT,
     PRESENTATION_RULES,
     STRICT_METRIC_SELECTION_RULES,
+    COLUMN_DISPLAY_NAMES,
 )
 from semantic_model import BILLING_SEMANTIC_MODEL, COLLECTIONS_SEMANTIC_MODEL, AR_SEMANTIC_MODEL
 
@@ -25,6 +26,47 @@ database_url = os.getenv("DATABASE_URL")
 
 client = Anthropic(api_key=api_key)
 engine = create_engine(database_url) if database_url else None
+
+
+def format_column_name(col: str) -> str:
+    """snake_case → Title Case fallback for unknown columns."""
+    return col.replace("_", " ").title()
+
+
+def fill_display_columns(display: dict, df_columns: list) -> dict:
+    """
+    Ensures every SQL column has a display name. Priority:
+      1. Claude's explicit mapping (already in display.columns)
+      2. COLUMN_DISPLAY_NAMES dict (known aliases, fee columns, abbreviations)
+      3. format_column_name() title-case fallback
+
+    Deduplication: if two columns resolve to the same display name, appends
+    the currency suffix from the column name (_inr / _usd).
+    e.g. collection_inr + collection_usd both → "Collections"
+    becomes "Collections (INR)" and "Collections (USD)".
+    """
+    col_map = display.get("columns", {})
+
+    for col in df_columns:
+        if col not in col_map:
+            col_map[col] = COLUMN_DISPLAY_NAMES.get(col, format_column_name(col))
+
+    # Detect and fix duplicate display names
+    name_counts: dict[str, int] = {}
+    for name in col_map.values():
+        name_counts[name] = name_counts.get(name, 0) + 1
+
+    for col, name in list(col_map.items()):
+        if name_counts[name] > 1:
+            if col.endswith("_inr"):
+                col_map[col] = f"{name} (INR)"
+            elif col.endswith("_usd"):
+                col_map[col] = f"{name} (USD)"
+            else:
+                col_map[col] = f"{name} ({col.upper()})"
+
+    display["columns"] = col_map
+    return display
 
 
 def get_fy_info() -> dict:
@@ -538,6 +580,8 @@ def chat(request: ChatRequest):
 
         # Build a plain-text assistant summary for conversation history storage
         display  = parsed.get("display", {})
+        display  = fill_display_columns(display, list(df.columns))
+        parsed["display"] = display
         assistant_summary = (
             f"Report generated: {display.get('title', 'Untitled')}\n"
             f"{parsed.get('explanation', '')}\n"

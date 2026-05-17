@@ -38,7 +38,7 @@ with st.sidebar:
         st.caption("USD: Bn / Mn / K  |  INR: Cr / L / K")
 
     st.divider()
-    if st.button("🗑️ Clear conversation", use_container_width=True):
+    if st.button("🗑️ Clear conversation", width='stretch'):
         st.session_state.exchanges    = []
         st.session_state.chat_history = []
         st.rerun()
@@ -130,6 +130,69 @@ def strip_currency_suffix(name):
     for suffix in [" (USD)", " (INR)", " (usd)", " (inr)", " (Usd)", " (Inr)"]:
         name = name.replace(suffix, "")
     return name.strip()
+
+
+def deduplicate_column_map(column_map: dict) -> dict:
+    """
+    If two SQL columns map to the same display name, append (INR) / (USD)
+    based on the column suffix so df.rename() never produces duplicate headers.
+    Works on both Claude-supplied and auto-generated display names.
+    """
+    name_counts: dict[str, int] = {}
+    for name in column_map.values():
+        name_counts[name] = name_counts.get(name, 0) + 1
+
+    result = {}
+    for col, name in column_map.items():
+        if name_counts[name] > 1:
+            if col.endswith("_inr"):
+                result[col] = f"{name} (INR)"
+            elif col.endswith("_usd"):
+                result[col] = f"{name} (USD)"
+            else:
+                result[col] = f"{name} ({col})"
+        else:
+            result[col] = name
+    return result
+
+
+def format_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detects string columns containing dates and formats them for display:
+      - All date values are 1st of month  → "Apr 2025"  (monthly grouping)
+      - Other date values                  → "01 Apr 2025"
+    Non-date values in the same column (e.g. "Grand Total") are left untouched.
+    """
+    DATE_RE = r'^\d{4}-\d{2}-\d{2}$'
+    IGNORE  = {'', 'grand total', 'Grand Total'}
+
+    for col in df.columns:
+        if not (pd.api.types.is_object_dtype(df[col]) or
+                pd.api.types.is_string_dtype(df[col])):
+            continue
+
+        str_vals = df[col].fillna('').astype(str)
+        date_mask = str_vals.str.match(DATE_RE)
+
+        # Must have at least one date; all non-empty, non-label values must be dates
+        date_vals = str_vals[date_mask]
+        non_date  = str_vals[~date_mask & ~str_vals.isin(IGNORE)]
+        if date_vals.empty or not non_date.empty:
+            continue
+
+        try:
+            parsed = pd.to_datetime(date_vals, errors='coerce').dropna()
+            if parsed.empty:
+                continue
+            fmt = '%b %Y' if (parsed.dt.day == 1).all() else '%d %b %Y'
+            # Only reformat the cells that are date strings; leave labels as-is
+            full_parsed = pd.to_datetime(df[col], errors='coerce')
+            df = df.copy()
+            df.loc[date_mask, col] = full_parsed[date_mask].dt.strftime(fmt)
+        except Exception:
+            pass
+
+    return df
 
 def is_time_column(col):
     """Returns True if column looks like a time/period dimension."""
@@ -229,12 +292,14 @@ def apply_detail_formatting(df, metadata):
     No Row %, no Grand Total.
     """
     display    = metadata.get("display", {})
-    column_map = {k: strip_currency_suffix(v)
-                  for k, v in display.get("columns", {}).items()}
+    column_map = deduplicate_column_map(
+                    {k: strip_currency_suffix(v)
+                     for k, v in display.get("columns", {}).items()})
     currency   = display.get("currency", "INR")
     formatting = display.get("formatting", {})
 
     df = df.rename(columns=column_map)
+    df = format_date_columns(df)
 
     # Apply explicit formatting from metadata
     for original_col, rule in formatting.items():
@@ -387,8 +452,9 @@ def apply_display_formatting(df, metadata):
                     if isinstance(x, (int, float)) and pd.notnull(x) else ""
                 )
 
-    clean_map = {k: strip_currency_suffix(v) for k, v in column_map.items()}
+    clean_map = deduplicate_column_map({k: strip_currency_suffix(v) for k, v in column_map.items()})
     df = df.rename(columns=clean_map)
+    df = format_date_columns(df)
     df = reorder_columns(df)
 
     return df
@@ -502,7 +568,7 @@ def apply_metric_pivot_formatting(df, metadata):
     metric_cols_raw = metadata.get("metric_columns", [])
 
     # Rename SQL aliases to display names (strip currency suffix from headers)
-    column_map = {k: strip_currency_suffix(v) for k, v in column_map.items()}
+    column_map = deduplicate_column_map({k: strip_currency_suffix(v) for k, v in column_map.items()})
     df = df.rename(columns=column_map)
     renamed_rows    = [column_map.get(r, r) for r in row_dims]
     renamed_metrics = [column_map.get(m, m) for m in metric_cols_raw]
@@ -743,7 +809,7 @@ def render_chart(df, metadata, view_key: str = "default"):
 
     df_chart     = df.rename(columns=col_map)
     numeric_cols = df_chart.select_dtypes(include="number").columns.tolist()
-    string_cols  = df_chart.select_dtypes(include="object").columns.tolist()
+    string_cols  = df_chart.select_dtypes(include=["object", "str"]).columns.tolist()
 
     raw_values    = st.session_state.get("raw_values", False)
     PLOTLY_COLORS = px.colors.qualitative.Set2
@@ -756,6 +822,8 @@ def render_chart(df, metadata, view_key: str = "default"):
         if not dim_col or not numeric_cols:
             st.info("Not enough data to draw a chart.")
             return
+        if is_time_column(dim_col):
+            df_chart = df_chart.sort_values(dim_col, ascending=True).reset_index(drop=True)
         fig = px.line(
             df_chart, x=dim_col, y=numeric_cols,
             title=title, markers=True, color_discrete_sequence=PLOTLY_COLORS,
@@ -767,7 +835,7 @@ def render_chart(df, metadata, view_key: str = "default"):
             yaxis=dict(tickformat=tick_fmt),
         )
         fig.update_traces(hovertemplate=f"%{{y:{tick_fmt}}}")
-        st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+        st.plotly_chart(fig, width='stretch', key=f"chart_{view_key}_{id(fig)}")
 
     # ── BAR CHART ─────────────────────────────────────────────────────────────
     elif viz == "bar_chart":
@@ -817,6 +885,11 @@ def render_chart(df, metadata, view_key: str = "default"):
         else:
             n_rows = len(df_chart)
             chart_height = max(350, min(600, n_rows * 45 + 80))
+
+            # Sort by time dimension so quarters/dates appear in order
+            if is_time_column(dim_col):
+                df_chart = df_chart.sort_values(dim_col, ascending=True).reset_index(drop=True)
+
             if len(metric_list) > 1:
                 fig = px.bar(
                     df_chart, x=dim_col, y=metric_list, barmode="group",
@@ -836,7 +909,7 @@ def render_chart(df, metadata, view_key: str = "default"):
                 legend_title="Metric",
                 margin=dict(l=10, r=10, t=40, b=10),
             )
-        st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+        st.plotly_chart(fig, width='stretch', key=f"chart_{view_key}_{id(fig)}")
 
     # ── PIVOT TABLE ───────────────────────────────────────────────────────────
     elif viz == "pivot_table":
@@ -883,7 +956,7 @@ def render_chart(df, metadata, view_key: str = "default"):
                     legend_title="Revenue Type",
                 )
 
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+            st.plotly_chart(fig, width='stretch', key=f"chart_{view_key}_{id(fig)}")
 
         elif pivot_type == "dimension":
             rows_meta   = metadata.get("rows", [])
@@ -923,7 +996,7 @@ def render_chart(df, metadata, view_key: str = "default"):
                         xref="x", yref="y",
                     )
             fig.update_layout(xaxis_title=c, yaxis_title=r)
-            st.plotly_chart(fig, use_container_width=True, key=f"chart_{view_key}_{id(fig)}")
+            st.plotly_chart(fig, width='stretch', key=f"chart_{view_key}_{id(fig)}")
 
     else:
         st.info("Chart not available for this result type.")
@@ -937,6 +1010,11 @@ def render_result(df, metadata, result, view_key: str = "default"):
     if metadata.get("metric_columns"):
         visualization          = "pivot_table"
         metadata["pivot_type"] = "metric"
+
+    # Empty result — show a clean message rather than crashing downstream
+    if df.empty:
+        st.info("No data found for this query. Try adjusting the filters or time period.")
+        return
 
     sql_lower = metadata.get("sql", "").lower()
     is_detail = "group by" not in sql_lower
@@ -970,19 +1048,84 @@ def render_result(df, metadata, result, view_key: str = "default"):
         elif visualization == "pivot_table" and metadata.get("pivot_type") == "dimension":
             rows        = metadata["rows"]
             columns     = metadata["columns"]
-            values      = metadata["values"][0]
             aggregation = metadata.get("aggregation", "sum")
 
-            pivot_df = df.pivot_table(
-                index=rows, columns=columns, values=values,
-                aggfunc=aggregation, fill_value=0
-            ).reset_index()
-            pivot_df.columns = [str(col) for col in pivot_df.columns]
+            # Resolve all requested value columns against actual df columns
+            col_display  = {v: k for k, v in display.get("columns", {}).items()}
+            raw_values   = metadata.get("values") or []
+            dim_set      = set(rows + columns)
 
-            column_map   = {k: strip_currency_suffix(v)
-                            for k, v in display.get("columns", {}).items()}
-            pivot_df     = pivot_df.rename(columns=column_map)
-            renamed_rows = [column_map.get(row, row) for row in rows]
+            resolved = []
+            for candidate in raw_values:
+                if candidate in df.columns:
+                    resolved.append(candidate)
+                else:
+                    raw = col_display.get(candidate)
+                    if raw and raw in df.columns:
+                        resolved.append(raw)
+
+            # Fall back to first numeric non-dimension column
+            if not resolved:
+                resolved = [c for c in df.select_dtypes(include="number").columns
+                            if c not in dim_set][:1]
+            if not resolved:
+                st.error("Could not determine a value column for this pivot.")
+                return
+
+            column_map = deduplicate_column_map(
+                            {k: strip_currency_suffix(v)
+                             for k, v in display.get("columns", {}).items()})
+
+            # ── Single value → standard flat pivot ─────────────────────────
+            if len(resolved) == 1:
+                pivot_df = df.pivot_table(
+                    index=rows, columns=columns, values=resolved[0],
+                    aggfunc=aggregation, fill_value=0
+                ).reset_index()
+                pivot_df.columns = [str(col) for col in pivot_df.columns]
+                pivot_df     = pivot_df.rename(columns=column_map)
+                renamed_rows = [column_map.get(r, r) for r in rows]
+
+            # ── Multiple values → MultiIndex pivot (grouped column headers) ─
+            else:
+                pivot_df = df.pivot_table(
+                    index=rows, columns=columns, values=resolved,
+                    aggfunc=aggregation, fill_value=0
+                )
+                # Swap levels: top = paying entity, bottom = metric label
+                pivot_df = pivot_df.swaplevel(axis=1).sort_index(axis=1)
+
+                # Clean metric sub-labels: collection_inr → INR, collection_usd → USD
+                def clean_metric_label(col):
+                    if col.endswith("_inr"): return "INR"
+                    if col.endswith("_usd"): return "USD"
+                    return strip_currency_suffix(column_map.get(col, col))
+
+                pivot_df.columns = pd.MultiIndex.from_tuples(
+                    [(str(top), clean_metric_label(bot))
+                     for top, bot in pivot_df.columns]
+                )
+                pivot_df = pivot_df.reset_index()
+
+                # Rename the row dimension column
+                pivot_df = pivot_df.rename(
+                    columns={rows[0]: column_map.get(rows[0], rows[0])}
+                )
+                renamed_rows = [column_map.get(r, r) for r in rows]
+
+                # Grand total row (sum numeric cols)
+                grand = {col: "" for col in pivot_df.columns}
+                grand[pivot_df.columns[0]] = "Grand Total"
+                for col in pivot_df.columns[1:]:
+                    try:
+                        grand[col] = pivot_df[col].sum()
+                    except TypeError:
+                        grand[col] = ""
+                pivot_df = pd.concat(
+                    [pivot_df, pd.DataFrame([grand])], ignore_index=True
+                )
+                st.dataframe(pivot_df, width='stretch', hide_index=True)
+                return   # skip the shared formatting path below
 
             row_label = column_map.get(rows[0], rows[0]) if rows else ""
             col_label = column_map.get(columns[0], columns[0]) if columns else ""

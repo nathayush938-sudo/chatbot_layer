@@ -238,20 +238,163 @@ SQL OPTIMISATION RULES:
   - Keep SQL minimal: SELECT, FROM, WHERE, GROUP BY only.
 
 ────────────────────────────────────────────
-COMMON DASHBOARD REPORTS:
+NAMED DASHBOARD REPORTS:
 ────────────────────────────────────────────
-  1.  YTD Billing            : SUM(billing_amount * usd_exchangerate), current FY filter
-  2.  QoQ Billing            : GROUP BY transaction_fy_quarter
-  3.  Billing by Region      : GROUP BY region
-  4.  Billing by Subsidiary  : GROUP BY subsidiary_name
-  5.  Billing by Customer    : GROUP BY customer_name
-  6.  Billing by Currency    : GROUP BY currency_symbol
-  7.  Billing Type Split     : metric pivot, rows=[], 6 fee types + tax
-  8.  Billing by Region + Type Split : metric pivot, rows=[region], all fee types + tax
-  9.  Intercompany Billing   : inter_company_status='T', pivot rows=subsidiary_name cols=paying_entity
-  10. Billing by Client Bucket     : GROUP BY client_buckets
-  11. Billing by Customer Journey  : GROUP BY client_journey_stage
-  12. Billing Summary Table        : SELECT * with default filters (see SUMMARY TABLE above)
+  These are pre-defined report patterns. Match trigger phrases exactly and
+  generate the specified SQL + visualization every time.
+
+  ── 1. QoQ / YoY REVENUE TREND ───────────────────────────────────────────
+  Triggers: "billing trend", "revenue trend", "QoQ billing", "quarterly trend",
+            "billing by quarter", "YoY billing", "billing over time",
+            "quarterly billing", "billing trend by quarter"
+
+  visualization: line_chart
+  x_axis: transaction_fy_quarter
+  Default: current FY quarters. "last 3 years" / "all time" → remove time filter.
+  "by year" → GROUP BY LEFT(transaction_fy_quarter,4) AS fy_year, use bar_chart.
+
+  SQL (current FY default):
+    SELECT
+        transaction_fy_quarter,
+        SUM(billing_amount * usd_exchangerate) AS billed_revenue_usd
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+    GROUP BY transaction_fy_quarter
+
+  display:
+    title: "Billing Trend - <FY>"
+    columns: {{ "transaction_fy_quarter": "Quarter", "billed_revenue_usd": "Billed Revenue" }}
+    formatting: {{ "billed_revenue_usd": {{ "type": "currency", "currency": "USD", "decimals": 0 }} }}
+
+  ── 2. TOP 10 CUSTOMERS ───────────────────────────────────────────────────
+  Triggers: "top 10 customers", "top customers", "top 10 by billing",
+            "largest customers", "biggest customers", "top customers by revenue",
+            "top 10 accounts", "highest billing customers"
+
+  visualization: bar_chart
+  orientation: horizontal (largest at top)
+  Default: current FY, external only, customer_name IS NOT NULL.
+  N is configurable — "top 5" → LIMIT 5, "top 20" → LIMIT 20.
+
+  SQL:
+    SELECT
+        customer_name,
+        SUM(billing_amount * usd_exchangerate) AS billed_revenue_usd
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+      AND customer_name IS NOT NULL
+    GROUP BY customer_name
+    ORDER BY billed_revenue_usd DESC
+    LIMIT 10
+
+  display:
+    title: "Top 10 Customers by Billing - <FY>"
+    columns: {{ "customer_name": "Customer", "billed_revenue_usd": "Billed Revenue" }}
+    formatting: {{ "billed_revenue_usd": {{ "type": "currency", "currency": "USD", "decimals": 0 }} }}
+
+  ── 3. BILLING BY CURRENCY ────────────────────────────────────────────────
+  Triggers: "billing by currency", "revenue by currency", "currency breakdown",
+            "billing currency split", "billing per currency",
+            "which currencies are we billing in", "currency wise billing"
+
+  visualization: bar_chart
+  Default: current FY, external only.
+
+  SQL:
+    SELECT
+        currency_symbol,
+        SUM(billing_amount * usd_exchangerate)                              AS billed_revenue_usd,
+        SUM((billing_amount - COALESCE(transaction_tax,0)) * usd_exchangerate) AS billed_revenue_excl_tax_usd
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+    GROUP BY currency_symbol
+
+  display:
+    title: "Billing by Currency - <FY>"
+    columns: {{ "currency_symbol": "Currency", "billed_revenue_usd": "Billed Revenue",
+                "billed_revenue_excl_tax_usd": "Billed Revenue (Ex-Tax)" }}
+    formatting: both amount cols → type: currency, currency: USD, decimals: 0
+
+  ── 4. INVOICE TYPE SPLIT ─────────────────────────────────────────────────
+  Triggers: "invoice type split", "billing type split", "revenue split",
+            "fee split", "type of billing", "revenue by type",
+            "subscription vs implementation", "billing breakdown by type"
+  (See also TYPE SPLIT RULES above for dimension variants)
+
+  visualization: pivot_table, pivot_type: metric
+  rows: [] (no dimension) unless user specifies one
+  Default: current FY, external only.
+
+  SQL (no dimension):
+    SELECT
+        SUM(subscriptionfee    * usd_exchangerate)                                                AS subscription_revenue_usd,
+        SUM(implementationfee  * usd_exchangerate)                                                AS implementation_revenue_usd,
+        SUM(integrationfee     * usd_exchangerate)                                                AS integration_revenue_usd,
+        SUM(studiofee          * usd_exchangerate)                                                AS studio_revenue_usd,
+        SUM((COALESCE(amsfee,0)+COALESCE(otherservicesfee,0)+COALESCE(openingsplitfee,0)) * usd_exchangerate) AS other_services_revenue_usd,
+        SUM(COALESCE(transaction_tax,0) * usd_exchangerate)                                       AS tax_amount_usd
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+
+  With dimension (e.g. "by region"):
+    Add dimension to SELECT + GROUP BY. Keep same 6 metrics + tax.
+    rows: ["region"] (or whichever dimension)
+
+  display:
+    title: "Billing by Invoice Type - <FY>"
+    metric_columns: [subscription_revenue_usd, implementation_revenue_usd,
+                     integration_revenue_usd, studio_revenue_usd,
+                     other_services_revenue_usd, tax_amount_usd]
+    formatting: all → type: currency, currency: USD, decimals: 0
+
+  ── 5. REVENUE BY REGION / SUBSIDIARY ────────────────────────────────────
+  Triggers: "billing by region", "revenue by region", "region wise billing",
+            "billing by subsidiary", "revenue by subsidiary", "entity wise billing",
+            "billing by billing entity", "subsidiary breakdown",
+            "region breakdown", "which region bills the most"
+
+  visualization: bar_chart
+  Dimension: region (default) or subsidiary_name if user says "subsidiary"/"entity"
+  Default: current FY, external only.
+
+  SQL (by region):
+    SELECT
+        region,
+        SUM(billing_amount * usd_exchangerate) AS billed_revenue_usd
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+    GROUP BY region
+
+  SQL (by subsidiary):
+    SELECT
+        subsidiary_name,
+        SUM(billing_amount * usd_exchangerate) AS billed_revenue_usd
+    FROM billing
+    WHERE inter_company_status = 'F'
+      AND transaction_fy_quarter LIKE '<current_fy>%'
+    GROUP BY subsidiary_name
+
+  display (region):
+    title: "Billing by Region - <FY>"
+    columns: {{ "region": "Region", "billed_revenue_usd": "Billed Revenue" }}
+  display (subsidiary):
+    title: "Billing by Billing Entity - <FY>"
+    columns: {{ "subsidiary_name": "Billing Entity", "billed_revenue_usd": "Billed Revenue" }}
+  formatting: billed_revenue_usd → type: currency, currency: USD, decimals: 0
+
+────────────────────────────────────────────
+OTHER REPORTS (ad hoc):
+────────────────────────────────────────────
+  - YTD total billing         : single-row KPI, SUM(billing_amount * usd_exchangerate)
+  - Billing by client bucket  : GROUP BY client_buckets
+  - Billing by customer journey : GROUP BY client_journey_stage
+  - Intercompany billing      : inter_company_status='T', pivot subsidiary_name × paying_entity
+  - Billing summary table     : SELECT * with default filters (see SUMMARY TABLE above)
 
 ────────────────────────────────────────────
 DISPLAY RULES:
@@ -449,7 +592,18 @@ COMMON DASHBOARD REPORTS:
   7.  Collections by Currency   : GROUP BY currency_symbol
   8.  Collections by Client Bucket     : GROUP BY client_buckets
   9.  Collections by Customer Journey  : GROUP BY client_journey_stage
-  10. Intercompany Collections   : inter_company_status='T', pivot rows=subsidiary_name cols=paying_entity
+  10. Intercompany Collections   : inter_company_status='T', tds_flag='F'
+      visualization = pivot_table, pivot_type = dimension
+      rows = [subsidiary_name], columns = [paying_entity]
+      values = [collection_inr]              ← single metric (default)
+      values = [collection_inr, collection_usd]  ← when user asks for both currencies
+      SQL must SELECT all values listed. The frontend renders multiple values as
+      grouped column headers (top = paying entity, sub = INR / USD).
+      SQL: SELECT subsidiary_name, TRIM(paying_entity) AS paying_entity,
+               SUM(collection_amount * inr_exchangerate) AS collection_inr,
+               SUM(collection_amount * usd_exchangerate) AS collection_usd  ← only if requested
+           FROM collections WHERE inter_company_status='T' AND tds_flag='F'
+           GROUP BY subsidiary_name, TRIM(paying_entity)
   11. Cumulative Ageing by Quarter : dimension pivot rows=transaction_fy_quarter cols=ageingbucket
   12. Collections Summary Table  : SELECT * with default filters (see SUMMARY TABLE above)
 
